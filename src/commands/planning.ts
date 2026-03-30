@@ -19,7 +19,7 @@ export function planCommand(feature: string, opts: { profile?: string; json: boo
   console.log(opts.json ? JSON.stringify(plan, null, 2) : renderPlanMd(plan));
 }
 
-export function shapeCommand(feature: string): void {
+export function shapeCommand(feature: string, opts?: { description?: string; runtime?: string }): void {
   withDb((db) => {
     const ctx = buildContext(db);
     const plan = createBlankPlan(feature, ctx.projectRoot);
@@ -45,7 +45,34 @@ export function shapeCommand(feature: string): void {
     console.log(chalk.green(`Feature ${feature} initialized.`));
     console.log(`  Run: ${runId}`);
     console.log(`  Plan template: ${path}`);
-    console.log(`  Phase: plan`);
+
+    // Spawn planner agent
+    const description = opts?.description || feature.replace(/-/g, " ");
+    const taskPrompt = [
+      `Plan the feature: ${feature}`,
+      "",
+      `Description: ${description}`,
+      "",
+      `Write the plan to: ${path}`,
+      "",
+      "Explore the codebase first, then produce a structured plan with tasks, file scopes, verify commands, and dependencies.",
+    ].join("\n");
+
+    const identity = ctx.agents.allocateIdentity(`planner-${feature}`);
+    const info = ctx.agents.spawn({
+      identity,
+      runtimeId: opts?.runtime ?? ctx.config.agents.runtime,
+      capability: "planner",
+      feature,
+      taskPrompt,
+      runId,
+      baseBranch: ctx.config.project.canonicalBranch,
+    });
+
+    console.log(chalk.green(`  Planner spawned: ${info.name}`));
+    console.log(`  tmux: ${info.tmuxSession}`);
+    console.log("");
+    console.log(chalk.gray(`  Attach: tmux -L cnog attach -t ${info.tmuxSession}`));
   });
 }
 

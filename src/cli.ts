@@ -63,9 +63,14 @@ export function main(args: string[]): void {
           .option("runtime", { type: "string" }),
         (argv) => slingCommand(argv.feature!, argv.profile, argv.runtime))
 
-      .command("shape <feature>", "Create a feature skeleton",
-        (y) => y.positional("feature", { type: "string", demandOption: true }),
-        (argv) => shapeCommand(argv.feature!))
+      .command("shape <feature> [description..]", "Create a feature and spawn planner",
+        (y) => y.positional("feature", { type: "string", demandOption: true })
+          .positional("description", { type: "string", array: true })
+          .option("runtime", { type: "string" }),
+        (argv) => {
+          const desc = (argv.description as string[] | undefined)?.join(" ") || undefined;
+          shapeCommand(argv.feature!, { description: desc, runtime: argv.runtime });
+        })
 
       .command("plan <feature>", "Show or validate plan",
         (y) => y.positional("feature", { type: "string", demandOption: true })
