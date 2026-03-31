@@ -99,8 +99,8 @@ export const DEFAULTS = {
   bootDelayMs: 2000,
   tickIntervalMs: 10_000,
   maxWip: 4,
-  staleThresholdMs: 5 * 60 * 1000,
-  zombieThresholdMs: 15 * 60 * 1000,
+  staleThresholdMs: 15 * 60 * 1000,
+  zombieThresholdMs: 60 * 60 * 1000,
   dashboardRefreshMs: 2000,
   canonicalBranch: "main",
 } as const;

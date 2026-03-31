@@ -43,8 +43,8 @@ describe("paths constants", () => {
     expect(DEFAULTS.bootDelayMs).toBe(2000);
     expect(DEFAULTS.tickIntervalMs).toBe(10000);
     expect(DEFAULTS.maxWip).toBe(4);
-    expect(DEFAULTS.staleThresholdMs).toBe(300000);
-    expect(DEFAULTS.zombieThresholdMs).toBe(900000);
+    expect(DEFAULTS.staleThresholdMs).toBe(900000);
+    expect(DEFAULTS.zombieThresholdMs).toBe(3600000);
     expect(DEFAULTS.canonicalBranch).toBe("main");
   });
 });

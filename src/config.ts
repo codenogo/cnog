@@ -55,8 +55,8 @@ const DEFAULT_CONFIG: CnogConfig = {
     maxWip: 4,
   },
   watchdog: {
-    staleThresholdMs: 5 * 60 * 1000,
-    zombieThresholdMs: 15 * 60 * 1000,
+    staleThresholdMs: 15 * 60 * 1000,
+    zombieThresholdMs: 60 * 60 * 1000,
   },
   verify: {
     commands: [],

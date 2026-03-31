@@ -67,6 +67,14 @@ export function buildHooksConfig(opts: {
     ];
   }
 
+  // PostToolUse: auto-heartbeat on every tool use
+  hooks.PostToolUse = [
+    {
+      type: "PostToolUse",
+      command: `cnog heartbeat ${opts.agentName} 2>/dev/null || true`,
+    },
+  ];
+
   return {
     permissions: {
       allow: allowed,

@@ -62,7 +62,7 @@ export class AgentManager {
    *
    * Pipeline: validate -> worktree -> overlay -> tmux -> DB -> nudge
    */
-  allocateIdentity(logicalName: string): AgentIdentity {
+  allocateIdentity(logicalName: string, maxRetries: number = 3): AgentIdentity {
     const latest = this.db.sessions.getLatestByLogicalName(logicalName);
     if (latest && latest.state !== "completed" && latest.state !== "failed") {
       throw new CnogError("AGENT_ALREADY_EXISTS", {
@@ -72,6 +72,12 @@ export class AgentManager {
     }
 
     const attempt = latest ? latest.attempt + 1 : 1;
+    if (attempt > maxRetries + 1) {
+      throw new Error(
+        `Agent ${logicalName} has failed ${latest!.attempt} times (max retries: ${maxRetries}). Not retrying.`,
+      );
+    }
+
     return {
       logicalName,
       attempt,
