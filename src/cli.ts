@@ -12,7 +12,7 @@ import { ZodError } from "zod";
 import { initCommand } from "./commands/init.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { statusCommand } from "./commands/status.js";
-import { startCommand, stopCommand } from "./commands/orchestrator.js";
+import { startCommand, stopCommand, logsCommand as orchLogsCommand } from "./commands/orchestrator.js";
 import {
   slingCommand, agentsListCommand, spawnCommand, stopAgentCommand,
   inspectCommand, nudgeCommand, heartbeatCommand, evaluateCommand,

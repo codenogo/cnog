@@ -29,6 +29,7 @@ export const CHECKPOINT_DIR = join(CNOG_DIR, "agents");
 export const CONTRACTS_DIR = join(CNOG_DIR, "contracts");
 export const REVIEWS_DIR = join(CNOG_DIR, "reviews");
 export const PID_FILE = join(CNOG_DIR, "orchestrator.pid");
+export const LOG_FILE = join(CNOG_DIR, "orchestrator.log");
 
 // ---------------------------------------------------------------------------
 // Artifact paths (run-scoped)
