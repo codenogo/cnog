@@ -3,6 +3,7 @@ import chalk from "chalk";
 import type { Capability } from "../types.js";
 import { CapabilitySchema } from "../types.js";
 import * as tmux from "../tmux.js";
+import { isOrchestratorRunning } from "../config.js";
 import {
   buildContractEvaluationSpec,
   buildContractReviewCompletionCommand,
@@ -11,8 +12,15 @@ import {
   buildRunEvaluationSpec,
 } from "../review.js";
 import { withDb, buildContext } from "./context.js";
+import { startCommand } from "./orchestrator.js";
 
 export function slingCommand(feature: string, profile?: string, runtime?: string): void {
+  // Ensure the orchestrator daemon is running
+  if (!isOrchestratorRunning()) {
+    console.log(chalk.gray("  Starting orchestrator daemon..."));
+    startCommand();
+  }
+
   withDb((db) => {
     const ctx = buildContext(db);
     const proposalResults = ctx.dispatcher.dispatchFeature(feature, profile);
