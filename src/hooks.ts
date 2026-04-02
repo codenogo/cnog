@@ -71,7 +71,7 @@ export function buildHooksConfig(opts: {
   hooks.PostToolUse = [
     {
       type: "PostToolUse",
-      command: `cnog heartbeat ${opts.agentName} 2>/dev/null || true`,
+      command: `AGENT=${JSON.stringify(opts.agentName)} && TOOL="\${CLAUDE_TOOL_NAME:-}" && TARGET="\${CLAUDE_FILE_PATH:-}" && if [[ -n "$TARGET" ]]; then cnog progress update "$AGENT" --tool "$TOOL" --target "$TARGET" --quiet 2>/dev/null || true; else cnog progress update "$AGENT" --tool "$TOOL" --quiet 2>/dev/null || true; fi`,
     },
   ];
 

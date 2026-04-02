@@ -15,18 +15,15 @@
  */
 
 import type { CnogDB } from "./db.js";
-import type { EventEmitter } from "./events.js";
+import { EventEmitter } from "./events.js";
 import type { RunPhase, RunRow } from "./types.js";
 import { loadArtifactJson } from "./artifacts.js";
 import { loadContractFromArtifact } from "./contracts.js";
 import { computeCurrentScopeHash } from "./review.js";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { runArchiveDir } from "./paths.js";
-import * as tmux from "./tmux.js";
-import * as worktree from "./worktree.js";
+import { RunController } from "./run-controller.js";
 
 interface VerifyReportArtifact {
+  mode?: "canonical" | "issue" | "review_scope";
   scopeHash: string;
   passed: boolean;
 }
@@ -155,52 +152,13 @@ export class Lifecycle {
       throw new LifecycleError(`Run ${runId} already has merged entries and cannot be reset safely`);
     }
 
-    const archiveDir = runArchiveDir(run.feature, run.id, this.projectRoot);
-    mkdirSync(archiveDir, { recursive: true });
-
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const archivePath = join(archiveDir, `reset-${timestamp}.json`);
-    const scopes = this.db.reviewScopes.listByRun(runId);
-    const archivePayload = {
-      archivedAt: new Date().toISOString(),
-      reason,
-      run,
-      issues: this.db.issues.list({ run_id: runId }),
-      sessions: this.db.sessions.list({ run_id: runId }),
-      merges,
-      scopes,
-      reviewAttempts: scopes.flatMap((scope) => this.db.reviewAttempts.listByScope(scope.id)),
-      artifacts: this.db.artifacts.listByRun(runId),
-    };
-    writeFileSync(archivePath, JSON.stringify(archivePayload, null, 2), "utf-8");
-
-    for (const session of this.db.sessions.list({ run_id: runId })) {
-      if (session.tmux_session) {
-        tmux.killSession(session.tmux_session);
-      }
-      if (session.worktree_path) {
-        worktree.remove(session.name, this.projectRoot, true);
-      }
-      if (session.feature && session.branch) {
-        worktree.deleteBranch(session.feature, session.name, this.projectRoot, true);
-      }
-      if (session.state !== "completed" && session.state !== "failed") {
-        this.db.sessions.updateState(session.name, "failed", `run reset: ${reason}`);
-      }
-    }
-
-    this.db.issues.resetRun(runId);
-    this.db.merges.failNonMergedForRun(runId);
-    this.db.reviewScopes.staleForRun(runId);
-
     const targetPhase = this.resetTargetPhase(runId);
-    this.db.runs.update(runId, {
-      status: targetPhase,
-      phase_reason: `reset: ${reason}`,
-      review: null,
-      ship: null,
-      tasks: null,
-    });
+    const controller = new RunController(
+      this.db,
+      this.events ?? new EventEmitter(this.db),
+      this.projectRoot,
+    );
+    const { archivePath } = controller.resetRun(runId, reason, targetPhase);
     this.syncFeaturePhaseCache(run.feature, targetPhase);
 
     this.events?.emit({
@@ -286,7 +244,8 @@ export class Lifecycle {
     const verifyArtifacts = this.db.artifacts.listByRun(runId, "verify-report");
     const matchingVerify = [...verifyArtifacts].reverse().find((artifact) => {
       const report = loadArtifactJson<VerifyReportArtifact>(artifact, this.projectRoot);
-      return report?.scopeHash === approved.scope_hash;
+      return report?.scopeHash === approved.scope_hash
+        && (report.mode === "canonical" || report.mode == null);
     });
 
     if (!matchingVerify) {

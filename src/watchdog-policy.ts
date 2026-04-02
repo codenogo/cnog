@@ -10,6 +10,8 @@ export interface HealthObservation {
   tmuxAlive: boolean;
   pidAlive: boolean;
   elapsedMs: number;
+  transcriptGrew?: boolean;
+  waitingForInput?: boolean;
 }
 
 export type HealthKind = "healthy" | "recovered" | "dead" | "stale" | "zombie";
@@ -63,6 +65,16 @@ export function evaluateHealth(
   }
 
   if (observation.elapsedMs > thresholds.zombieThresholdMs) {
+    if (observation.waitingForInput) {
+      return {
+        kind: "stale",
+        action: "mark_stalled",
+        nextState: "stalled",
+        reason: "waiting for interactive input",
+        shouldNotify: false,
+        shouldNudge: session.state !== "stalled",
+      };
+    }
     return {
       kind: "zombie",
       action: "kill_tmux",
@@ -78,7 +90,9 @@ export function evaluateHealth(
       kind: "stale",
       action: "mark_stalled",
       nextState: "stalled",
-      reason: `no heartbeat for ${Math.round(observation.elapsedMs / 60000)}min`,
+      reason: observation.waitingForInput
+        ? "waiting for interactive input"
+        : `no heartbeat for ${Math.round(observation.elapsedMs / 60000)}min`,
       shouldNotify: false,
       shouldNudge: session.state !== "stalled",
     };

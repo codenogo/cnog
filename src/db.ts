@@ -9,7 +9,9 @@
 
 import Database from "better-sqlite3";
 import type {
+  ExecutionTaskControlState,
   SessionRow,
+  SessionProgressRow,
   MessageRow,
   MergeQueueRow,
   RunRow,
@@ -22,7 +24,16 @@ import type {
   ArtifactRow,
   ReviewScopeRow,
   ReviewAttemptRow,
+  ExecutionTaskRow,
 } from "./types.js";
+import {
+  buildExecutionTaskProgressSnapshotFromSession,
+  createExecutionTaskControlState,
+  deriveExecutionTaskControlStateFromMutation,
+  parseExecutionTaskControlState,
+  serializeExecutionTaskControlState,
+} from "./execution-task-state.js";
+import { ExecutionTaskControlStateSchema } from "./types.js";
 
 const SCHEMA = `
 -- Delivery runs (must be created before sessions/issues/merge entries)
@@ -51,7 +62,9 @@ CREATE TABLE IF NOT EXISTS sessions (
   capability TEXT NOT NULL CHECK(capability IN ('planner','builder','evaluator')),
   feature TEXT,
   task_id TEXT,
+  execution_task_id TEXT REFERENCES execution_tasks(id),
   worktree_path TEXT,
+  transcript_path TEXT,
   branch TEXT,
   tmux_session TEXT,
   pid INTEGER,
@@ -71,7 +84,7 @@ CREATE TABLE IF NOT EXISTS messages (
   to_agent TEXT NOT NULL,
   subject TEXT NOT NULL DEFAULT '',
   body TEXT,
-  type TEXT NOT NULL CHECK(type IN ('status','result','error','worker_done','merge_ready','escalation')),
+  type TEXT NOT NULL CHECK(type IN ('status','worker_notification')),
   priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),
   thread_id TEXT,
   payload TEXT,
@@ -107,6 +120,26 @@ CREATE TABLE IF NOT EXISTS metrics (
   output_tokens INTEGER NOT NULL DEFAULT 0,
   cost_usd REAL NOT NULL DEFAULT 0,
   recorded_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Mutable per-session observability snapshot (non-authoritative)
+CREATE TABLE IF NOT EXISTS session_progress (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  execution_task_id TEXT REFERENCES execution_tasks(id),
+  transcript_path TEXT,
+  transcript_size INTEGER NOT NULL DEFAULT 0,
+  last_output_at TEXT,
+  last_activity_at TEXT,
+  last_activity_kind TEXT CHECK(last_activity_kind IS NULL OR last_activity_kind IN ('read','write','search','bash','workflow','other')),
+  last_activity_summary TEXT,
+  last_tool_name TEXT,
+  tool_use_count INTEGER NOT NULL DEFAULT 0,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  recent_activities_json TEXT NOT NULL DEFAULT '[]',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- Structured event log
@@ -173,7 +206,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id),
   feature TEXT NOT NULL,
-  type TEXT NOT NULL CHECK(type IN ('plan','contract','checkpoint','review-scope','review-report','grading-report','verify-report','merge-record','ship-report')),
+  type TEXT NOT NULL CHECK(type IN ('plan','prompt-contract','contract','checkpoint','review-scope','review-report','grading-report','verify-report','merge-record','ship-report')),
   path TEXT NOT NULL,
   hash TEXT NOT NULL,
   issue_id TEXT REFERENCES issues(id),
@@ -212,15 +245,51 @@ CREATE TABLE IF NOT EXISTS review_attempts (
   completed_at TEXT
 );
 
+-- Runtime execution tasks (stable work units; sessions are attempts)
+CREATE TABLE IF NOT EXISTS execution_tasks (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  issue_id TEXT REFERENCES issues(id),
+  review_scope_id TEXT REFERENCES review_scopes(id),
+  parent_task_id TEXT REFERENCES execution_tasks(id),
+  logical_name TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('build','contract_review','implementation_review','merge','verify')),
+  capability TEXT NOT NULL CHECK(capability IN ('builder','evaluator','system','shell')),
+  executor TEXT NOT NULL CHECK(executor IN ('agent','shell','system')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','blocked','completed','failed','superseded')),
+  active_session_id TEXT REFERENCES sessions(id),
+  summary TEXT,
+  output_path TEXT,
+  result_path TEXT,
+  head_sha TEXT,
+  files_modified TEXT,
+  command TEXT,
+  cwd TEXT,
+  process_id INTEGER,
+  exit_code INTEGER,
+  output_size INTEGER NOT NULL DEFAULT 0,
+  last_output_at TEXT,
+  output_offset INTEGER NOT NULL DEFAULT 0,
+  notified INTEGER NOT NULL DEFAULT 0 CHECK(notified IN (0,1)),
+  notified_at TEXT,
+  last_error TEXT,
+  control_state_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  completed_at TEXT
+);
+
 -- Indexes for query performance
 CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
 CREATE INDEX IF NOT EXISTS idx_sessions_feature ON sessions(feature);
 CREATE INDEX IF NOT EXISTS idx_sessions_run ON sessions(run_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_execution_task ON sessions(execution_task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_logical_attempt ON sessions(logical_name, attempt);
 CREATE INDEX IF NOT EXISTS idx_messages_to_read ON messages(to_agent, read);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id);
 CREATE INDEX IF NOT EXISTS idx_metrics_run ON metrics(run_id);
+CREATE INDEX IF NOT EXISTS idx_session_progress_run ON session_progress(run_id);
 CREATE INDEX IF NOT EXISTS idx_merge_queue_status ON merge_queue(status, enqueued_at);
 CREATE INDEX IF NOT EXISTS idx_merge_queue_run ON merge_queue(run_id);
 CREATE INDEX IF NOT EXISTS idx_events_agent_ts ON events(agent_name, timestamp);
@@ -236,6 +305,9 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_feature ON artifacts(feature);
 CREATE INDEX IF NOT EXISTS idx_review_scopes_run ON review_scopes(run_id);
 CREATE INDEX IF NOT EXISTS idx_review_scopes_hash ON review_scopes(run_id, scope_hash);
 CREATE INDEX IF NOT EXISTS idx_review_attempts_scope ON review_attempts(scope_id);
+CREATE INDEX IF NOT EXISTS idx_execution_tasks_run_status ON execution_tasks(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_execution_tasks_issue ON execution_tasks(issue_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_tasks_run_logical ON execution_tasks(run_id, logical_name);
 
 -- Partial unique: one active (non-terminal) run per feature
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_active_feature
@@ -250,6 +322,34 @@ function now(): string {
   return new Date().toISOString().replace("T", " ").slice(0, 19);
 }
 
+function hasColumn(db: Database.Database, table: string, column: string): boolean {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return rows.some((row) => row.name === column);
+}
+
+function tableSql(db: Database.Database, table: string): string {
+  const row = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+  ).get(table) as { sql: string | null } | undefined;
+  return row?.sql ?? "";
+}
+
+function messageIndexSql(): string {
+  return `
+    CREATE INDEX IF NOT EXISTS idx_messages_to_read ON messages(to_agent, read);
+    CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_run ON messages(run_id);
+  `;
+}
+
+function artifactIndexSql(): string {
+  return `
+    CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
+    CREATE INDEX IF NOT EXISTS idx_artifacts_type ON artifacts(run_id, type);
+    CREATE INDEX IF NOT EXISTS idx_artifacts_feature ON artifacts(feature);
+  `;
+}
+
 // ---------------------------------------------------------------------------
 // Domain Store: Sessions
 // ---------------------------------------------------------------------------
@@ -258,14 +358,19 @@ export class SessionStore {
   constructor(private readonly raw: Database.Database) {}
 
   create(
-    row: Omit<SessionRow, "started_at" | "last_heartbeat" | "completed_at" | "error">,
+    row: Omit<SessionRow, "started_at" | "last_heartbeat" | "completed_at" | "error" | "execution_task_id">
+      & { execution_task_id?: string | null },
   ): void {
     this.raw
       .prepare(
-        `INSERT INTO sessions (id, name, logical_name, attempt, runtime, capability, feature, task_id, worktree_path, branch, tmux_session, pid, state, parent_agent, run_id, started_at)
-         VALUES (@id, @name, @logical_name, @attempt, @runtime, @capability, @feature, @task_id, @worktree_path, @branch, @tmux_session, @pid, @state, @parent_agent, @run_id, @started_at)`,
+        `INSERT INTO sessions (id, name, logical_name, attempt, runtime, capability, feature, task_id, execution_task_id, worktree_path, transcript_path, branch, tmux_session, pid, state, parent_agent, run_id, started_at)
+         VALUES (@id, @name, @logical_name, @attempt, @runtime, @capability, @feature, @task_id, @execution_task_id, @worktree_path, @transcript_path, @branch, @tmux_session, @pid, @state, @parent_agent, @run_id, @started_at)`,
       )
-      .run({ ...row, started_at: now() });
+      .run({
+        ...row,
+        execution_task_id: row.execution_task_id ?? null,
+        started_at: now(),
+      });
   }
 
   get(name: string): SessionRow | undefined {
@@ -413,6 +518,14 @@ export class MergeStore {
       )
       .run(runId);
   }
+
+  failPendingForIssue(runId: string, issueId: string): void {
+    this.raw
+      .prepare(
+        "UPDATE merge_queue SET status = 'failed', resolved_tier = COALESCE(resolved_tier, 'reimagine') WHERE run_id = ? AND task_id = ? AND status = 'pending'",
+      )
+      .run(runId, issueId);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +594,190 @@ export class MetricStore {
     return this.raw
       .prepare("SELECT COALESCE(SUM(cost_usd),0) as total_cost, COALESCE(SUM(input_tokens),0) as total_input, COALESCE(SUM(output_tokens),0) as total_output FROM metrics")
       .get() as { total_cost: number; total_input: number; total_output: number };
+  }
+
+  summaryForAgent(agentName: string, runId?: string | null): { total_cost: number; total_input: number; total_output: number; samples: number } {
+    if (runId) {
+      return this.raw
+        .prepare(
+          `SELECT
+             COALESCE(SUM(cost_usd),0) as total_cost,
+             COALESCE(SUM(input_tokens),0) as total_input,
+             COALESCE(SUM(output_tokens),0) as total_output,
+             COUNT(*) as samples
+           FROM metrics
+           WHERE agent_name = ? AND run_id = ?`,
+        )
+        .get(agentName, runId) as { total_cost: number; total_input: number; total_output: number; samples: number };
+    }
+
+    return this.raw
+      .prepare(
+        `SELECT
+           COALESCE(SUM(cost_usd),0) as total_cost,
+           COALESCE(SUM(input_tokens),0) as total_input,
+           COALESCE(SUM(output_tokens),0) as total_output,
+           COUNT(*) as samples
+         FROM metrics
+         WHERE agent_name = ?`,
+      )
+      .get(agentName) as { total_cost: number; total_input: number; total_output: number; samples: number };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Domain Store: Session Progress (non-authoritative observability)
+// ---------------------------------------------------------------------------
+
+export class SessionProgressStore {
+  constructor(private readonly raw: Database.Database) {}
+
+  private syncExecutionTaskProgress(sessionId: string): void {
+    const progress = this.get(sessionId);
+    const executionTaskId = progress?.execution_task_id;
+    if (!progress || !executionTaskId) {
+      return;
+    }
+
+    const taskRow = this.raw
+      .prepare("SELECT * FROM execution_tasks WHERE id = ?")
+      .get(executionTaskId) as ExecutionTaskRow | undefined;
+    if (!taskRow) {
+      return;
+    }
+
+    const currentState = parseExecutionTaskControlState(
+      taskRow.control_state_json,
+      taskRow.status,
+    );
+    const nextState = {
+      ...currentState,
+      progress: buildExecutionTaskProgressSnapshotFromSession(progress),
+    };
+
+    this.raw
+      .prepare("UPDATE execution_tasks SET control_state_json = ? WHERE id = ?")
+      .run(serializeExecutionTaskControlState(nextState), executionTaskId);
+  }
+
+  get(sessionId: string): SessionProgressRow | undefined {
+    return this.raw
+      .prepare("SELECT * FROM session_progress WHERE session_id = ?")
+      .get(sessionId) as SessionProgressRow | undefined;
+  }
+
+  getByAgent(agentName: string): SessionProgressRow | undefined {
+    return this.raw
+      .prepare(
+        `SELECT sp.*
+         FROM session_progress sp
+         JOIN sessions s ON s.id = sp.session_id
+         WHERE s.name = ?`,
+      )
+      .get(agentName) as SessionProgressRow | undefined;
+  }
+
+  listByRun(runId: string): SessionProgressRow[] {
+    return this.raw
+      .prepare("SELECT * FROM session_progress WHERE run_id = ? ORDER BY updated_at DESC")
+      .all(runId) as SessionProgressRow[];
+  }
+
+  ensureFromSession(sessionId: string): void {
+    this.raw
+      .prepare(
+        `INSERT INTO session_progress (
+           session_id, run_id, execution_task_id, transcript_path, updated_at
+         )
+         SELECT id, run_id, execution_task_id, transcript_path, @updated_at
+         FROM sessions
+         WHERE id = @session_id
+         ON CONFLICT(session_id) DO UPDATE SET
+           run_id = excluded.run_id,
+           execution_task_id = excluded.execution_task_id,
+           transcript_path = excluded.transcript_path,
+           updated_at = excluded.updated_at`,
+      )
+      .run({ session_id: sessionId, updated_at: now() });
+  }
+
+  update(
+    sessionId: string,
+    fields: Partial<Pick<
+      SessionProgressRow,
+      | "run_id"
+      | "execution_task_id"
+      | "transcript_path"
+      | "transcript_size"
+      | "last_output_at"
+      | "last_activity_at"
+      | "last_activity_kind"
+      | "last_activity_summary"
+      | "last_tool_name"
+      | "tool_use_count"
+      | "input_tokens"
+      | "output_tokens"
+      | "cost_usd"
+      | "recent_activities_json"
+    >>,
+  ): void {
+    this.ensureFromSession(sessionId);
+    const sets: string[] = ["updated_at = @updated_at"];
+    const params: Record<string, string | number | null> = {
+      session_id: sessionId,
+      updated_at: now(),
+    };
+    for (const [key, value] of Object.entries(fields)) {
+      sets.push(`${key} = @${key}`);
+      params[key] = value ?? null;
+    }
+    this.raw
+      .prepare(`UPDATE session_progress SET ${sets.join(", ")} WHERE session_id = @session_id`)
+      .run(params);
+    this.syncExecutionTaskProgress(sessionId);
+  }
+
+  recordActivity(opts: {
+    sessionId: string;
+    runId: string;
+    executionTaskId?: string | null;
+    transcriptPath?: string | null;
+    transcriptSize?: number;
+    toolName?: string | null;
+    activityKind: SessionProgressRow["last_activity_kind"];
+    summary: string;
+    target?: string | null;
+    at?: string;
+  }): void {
+    const existing = this.get(opts.sessionId);
+    const at = opts.at ?? now();
+    const recent = existing
+      ? JSON.parse(existing.recent_activities_json) as Array<{ at: string; kind: string | null; tool: string | null; target: string | null; summary: string }>
+      : [];
+    recent.push({
+      at,
+      kind: opts.activityKind,
+      tool: opts.toolName ?? null,
+      target: opts.target ?? null,
+      summary: opts.summary,
+    });
+    const recentTrimmed = recent.slice(-8);
+
+    const nextToolCount = (existing?.tool_use_count ?? 0) + 1;
+    this.ensureFromSession(opts.sessionId);
+    this.update(opts.sessionId, {
+      run_id: opts.runId,
+      execution_task_id: opts.executionTaskId ?? existing?.execution_task_id ?? null,
+      transcript_path: opts.transcriptPath ?? existing?.transcript_path ?? null,
+      transcript_size: opts.transcriptSize ?? existing?.transcript_size ?? 0,
+      last_output_at: opts.transcriptSize !== undefined ? at : (existing?.last_output_at ?? null),
+      last_activity_at: at,
+      last_activity_kind: opts.activityKind ?? null,
+      last_activity_summary: opts.summary,
+      last_tool_name: opts.toolName ?? null,
+      tool_use_count: nextToolCount,
+      recent_activities_json: JSON.stringify(recentTrimmed),
+    });
   }
 }
 
@@ -765,6 +1062,172 @@ export class ReviewAttemptStore {
 }
 
 // ---------------------------------------------------------------------------
+// Domain Store: Execution Tasks
+// ---------------------------------------------------------------------------
+
+export class ExecutionTaskStore {
+  constructor(private readonly raw: Database.Database) {}
+
+  create(
+    row: Omit<ExecutionTaskRow, "created_at" | "updated_at" | "completed_at" | "command" | "cwd" | "process_id" | "exit_code" | "output_size" | "last_output_at" | "head_sha" | "files_modified" | "control_state_json"> & Partial<Pick<ExecutionTaskRow, "command" | "cwd" | "process_id" | "exit_code" | "output_size" | "last_output_at" | "head_sha" | "files_modified" | "control_state_json">>,
+  ): void {
+    const taskStatus = row.status ?? "pending";
+    const controlStateJson = row.control_state_json
+      ?? serializeExecutionTaskControlState(createExecutionTaskControlState(taskStatus));
+    this.raw
+      .prepare(
+        `INSERT INTO execution_tasks (id, run_id, issue_id, review_scope_id, parent_task_id, logical_name, kind, capability, executor, status, active_session_id, summary, output_path, result_path, head_sha, files_modified, command, cwd, process_id, exit_code, output_size, last_output_at, output_offset, notified, notified_at, last_error, control_state_json, created_at, updated_at)
+         VALUES (@id, @run_id, @issue_id, @review_scope_id, @parent_task_id, @logical_name, @kind, @capability, @executor, @status, @active_session_id, @summary, @output_path, @result_path, @head_sha, @files_modified, @command, @cwd, @process_id, @exit_code, @output_size, @last_output_at, @output_offset, @notified, @notified_at, @last_error, @control_state_json, @created_at, @updated_at)`,
+      )
+      .run({
+        ...row,
+        head_sha: row.head_sha ?? null,
+        files_modified: row.files_modified ?? null,
+        command: row.command ?? null,
+        cwd: row.cwd ?? null,
+        process_id: row.process_id ?? null,
+        exit_code: row.exit_code ?? null,
+        output_size: row.output_size ?? 0,
+        last_output_at: row.last_output_at ?? null,
+        control_state_json: controlStateJson,
+        created_at: now(),
+        updated_at: now(),
+      });
+  }
+
+  get(id: string): ExecutionTaskRow | undefined {
+    return this.raw.prepare("SELECT * FROM execution_tasks WHERE id = ?").get(id) as ExecutionTaskRow | undefined;
+  }
+
+  getByLogicalName(runId: string, logicalName: string): ExecutionTaskRow | undefined {
+    return this.raw
+      .prepare(
+        "SELECT * FROM execution_tasks WHERE run_id = ? AND logical_name = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+      )
+      .get(runId, logicalName) as ExecutionTaskRow | undefined;
+  }
+
+  list(opts?: {
+    run_id?: string;
+    issue_id?: string;
+    review_scope_id?: string;
+    parent_task_id?: string;
+    status?: string;
+    capability?: string;
+    kind?: string;
+  }): ExecutionTaskRow[] {
+    let sql = "SELECT * FROM execution_tasks WHERE 1=1";
+    const params: Record<string, string> = {};
+    if (opts?.run_id) { sql += " AND run_id = @run_id"; params.run_id = opts.run_id; }
+    if (opts?.issue_id) { sql += " AND issue_id = @issue_id"; params.issue_id = opts.issue_id; }
+    if (opts?.review_scope_id) { sql += " AND review_scope_id = @review_scope_id"; params.review_scope_id = opts.review_scope_id; }
+    if (opts?.parent_task_id) { sql += " AND parent_task_id = @parent_task_id"; params.parent_task_id = opts.parent_task_id; }
+    if (opts?.status) { sql += " AND status = @status"; params.status = opts.status; }
+    if (opts?.capability) { sql += " AND capability = @capability"; params.capability = opts.capability; }
+    if (opts?.kind) { sql += " AND kind = @kind"; params.kind = opts.kind; }
+    sql += " ORDER BY created_at ASC, rowid ASC";
+    return this.raw.prepare(sql).all(params) as ExecutionTaskRow[];
+  }
+
+  active(runId?: string): ExecutionTaskRow[] {
+    if (runId) {
+      return this.raw
+        .prepare("SELECT * FROM execution_tasks WHERE run_id = ? AND status NOT IN ('blocked','completed','failed','superseded') ORDER BY created_at ASC, rowid ASC")
+        .all(runId) as ExecutionTaskRow[];
+    }
+    return this.raw
+      .prepare("SELECT * FROM execution_tasks WHERE status NOT IN ('blocked','completed','failed','superseded') ORDER BY created_at ASC, rowid ASC")
+      .all() as ExecutionTaskRow[];
+  }
+
+  childrenOf(parentTaskId: string): ExecutionTaskRow[] {
+    return this.raw
+      .prepare("SELECT * FROM execution_tasks WHERE parent_task_id = ? ORDER BY created_at ASC, rowid ASC")
+      .all(parentTaskId) as ExecutionTaskRow[];
+  }
+
+  update(
+    id: string,
+    fields: Partial<Pick<ExecutionTaskRow, "status" | "active_session_id" | "summary" | "output_path" | "result_path" | "head_sha" | "files_modified" | "command" | "cwd" | "process_id" | "exit_code" | "output_size" | "last_output_at" | "output_offset" | "notified" | "notified_at" | "last_error" | "issue_id" | "review_scope_id" | "parent_task_id" | "control_state_json">>,
+  ): void {
+    const existing = this.get(id);
+    if (!existing) {
+      return;
+    }
+
+    const updatedAt = now();
+    const sets: string[] = ["updated_at = @updated_at"];
+    const params: Record<string, string | number | null> = { id, updated_at: updatedAt };
+    const terminalStatus = fields.status === "completed" || fields.status === "failed" || fields.status === "superseded";
+    if (terminalStatus) {
+      sets.push("completed_at = @completed_at");
+      params.completed_at = updatedAt;
+    } else if (fields.status === "pending" || fields.status === "running" || fields.status === "blocked") {
+      sets.push("completed_at = NULL");
+    }
+
+    const nextControlStateJson = fields.control_state_json
+      ?? serializeExecutionTaskControlState(deriveExecutionTaskControlStateFromMutation(existing, fields, updatedAt));
+    fields.control_state_json = nextControlStateJson;
+
+    for (const [key, value] of Object.entries(fields)) {
+      sets.push(`${key} = @${key}`);
+      params[key] = value ?? null;
+    }
+    this.raw.prepare(`UPDATE execution_tasks SET ${sets.join(", ")} WHERE id = @id`).run(params);
+  }
+
+  markNotified(id: string): void {
+    this.update(id, {
+      notified: 1,
+      notified_at: now(),
+    });
+  }
+
+  pendingNotifications(runId?: string): ExecutionTaskRow[] {
+    if (runId) {
+      return this.raw
+        .prepare(
+          "SELECT * FROM execution_tasks WHERE run_id = ? AND status IN ('completed','failed','superseded') AND notified = 0 ORDER BY completed_at ASC, rowid ASC",
+        )
+        .all(runId) as ExecutionTaskRow[];
+    }
+
+    return this.raw
+      .prepare(
+        "SELECT * FROM execution_tasks WHERE status IN ('completed','failed','superseded') AND notified = 0 ORDER BY completed_at ASC, rowid ASC",
+      )
+      .all() as ExecutionTaskRow[];
+  }
+
+  controlState(taskOrId: ExecutionTaskRow | string): ExecutionTaskControlState {
+    const task = typeof taskOrId === "string" ? this.get(taskOrId) : taskOrId;
+    if (!task) {
+      return createExecutionTaskControlState();
+    }
+    return parseExecutionTaskControlState(task.control_state_json, task.status);
+  }
+
+  updateControlState(
+    id: string,
+    recipe: (state: ExecutionTaskControlState, task: ExecutionTaskRow) => ExecutionTaskControlState,
+  ): ExecutionTaskControlState | undefined {
+    const task = this.get(id);
+    if (!task) {
+      return undefined;
+    }
+    const nextState = recipe(
+      parseExecutionTaskControlState(task.control_state_json, task.status),
+      task,
+    );
+    this.update(id, {
+      control_state_json: serializeExecutionTaskControlState(nextState),
+    });
+    return nextState;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main Database (facade with domain stores)
 // ---------------------------------------------------------------------------
 
@@ -783,12 +1246,14 @@ export class CnogDB {
   readonly merges: MergeStore;
   readonly runs: RunStore;
   readonly metrics: MetricStore;
+  readonly sessionProgress: SessionProgressStore;
   readonly events: EventStore;
   readonly phases: PhaseStore;
   readonly issues: IssueStore;
   readonly artifacts: ArtifactStore;
   readonly reviewScopes: ReviewScopeStore;
   readonly reviewAttempts: ReviewAttemptStore;
+  readonly executionTasks: ExecutionTaskStore;
 
   constructor(dbPath: string) {
     this.db = new Database(dbPath);
@@ -798,18 +1263,422 @@ export class CnogDB {
     this.db.pragma("temp_store = MEMORY");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
+    this.migrateSchema();
 
     this.sessions = new SessionStore(this.db);
     this.messages = new MessageStore(this.db);
     this.merges = new MergeStore(this.db);
     this.runs = new RunStore(this.db);
     this.metrics = new MetricStore(this.db);
+    this.sessionProgress = new SessionProgressStore(this.db);
     this.events = new EventStore(this.db);
     this.phases = new PhaseStore(this.db);
     this.issues = new IssueStore(this.db);
     this.artifacts = new ArtifactStore(this.db);
     this.reviewScopes = new ReviewScopeStore(this.db);
     this.reviewAttempts = new ReviewAttemptStore(this.db);
+    this.executionTasks = new ExecutionTaskStore(this.db);
+  }
+
+  private migrateSchema(): void {
+    if (!hasColumn(this.db, "sessions", "transcript_path")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN transcript_path TEXT");
+    }
+
+    if (!tableSql(this.db, "session_progress")) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS session_progress (
+          session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+          run_id TEXT NOT NULL REFERENCES runs(id),
+          execution_task_id TEXT REFERENCES execution_tasks(id),
+          transcript_path TEXT,
+          transcript_size INTEGER NOT NULL DEFAULT 0,
+          last_output_at TEXT,
+          last_activity_at TEXT,
+          last_activity_kind TEXT CHECK(last_activity_kind IS NULL OR last_activity_kind IN ('read','write','search','bash','workflow','other')),
+          last_activity_summary TEXT,
+          last_tool_name TEXT,
+          tool_use_count INTEGER NOT NULL DEFAULT 0,
+          input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0,
+          cost_usd REAL NOT NULL DEFAULT 0,
+          recent_activities_json TEXT NOT NULL DEFAULT '[]',
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_progress_run ON session_progress(run_id);
+      `);
+    }
+
+    const messagesSql = tableSql(this.db, "messages").toLowerCase();
+    if (messagesSql && (!messagesSql.includes("'worker_notification'") || messagesSql.includes("'worker_done'") || messagesSql.includes("'result'") || messagesSql.includes("'merge_ready'") || messagesSql.includes("'escalation'") || messagesSql.includes("'error'"))) {
+      this.rebuildMessagesTable();
+    }
+
+    const artifactsSql = tableSql(this.db, "artifacts").toLowerCase();
+    if (artifactsSql && !artifactsSql.includes("'prompt-contract'")) {
+      this.rebuildArtifactsTable();
+    }
+
+    const executionTasksSql = tableSql(this.db, "execution_tasks").toLowerCase();
+    if (executionTasksSql && (!executionTasksSql.includes("parent_task_id") || !executionTasksSql.includes("'superseded'") || !executionTasksSql.includes("'blocked'") || !executionTasksSql.includes("process_id") || !executionTasksSql.includes("last_output_at"))) {
+      this.rebuildExecutionTasksTable();
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "executor")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN executor TEXT NOT NULL DEFAULT 'agent'");
+      this.db.exec(`
+        UPDATE execution_tasks
+        SET executor = CASE
+          WHEN capability = 'shell' THEN 'shell'
+          WHEN capability = 'system' THEN 'system'
+          ELSE 'agent'
+        END
+      `);
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "result_path")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN result_path TEXT");
+      this.db.exec("UPDATE execution_tasks SET result_path = output_path WHERE output_path IS NOT NULL AND result_path IS NULL");
+      this.db.exec("UPDATE execution_tasks SET output_path = NULL WHERE result_path IS NOT NULL");
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "parent_task_id")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN parent_task_id TEXT REFERENCES execution_tasks(id)");
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "output_offset")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN output_offset INTEGER NOT NULL DEFAULT 0");
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "notified")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN notified INTEGER NOT NULL DEFAULT 0");
+      this.db.exec(`
+        UPDATE execution_tasks
+        SET notified = CASE
+          WHEN status IN ('completed','failed') THEN 1
+          ELSE 0
+        END
+      `);
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "notified_at")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN notified_at TEXT");
+      this.db.exec(`
+        UPDATE execution_tasks
+        SET notified_at = CASE
+          WHEN notified = 1 THEN COALESCE(completed_at, datetime('now'))
+          ELSE NULL
+        END
+        WHERE notified_at IS NULL
+      `);
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "head_sha")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN head_sha TEXT");
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "files_modified")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN files_modified TEXT");
+    }
+
+    if (!hasColumn(this.db, "execution_tasks", "control_state_json")) {
+      this.db.exec("ALTER TABLE execution_tasks ADD COLUMN control_state_json TEXT NOT NULL DEFAULT '{}'");
+    }
+
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_execution_tasks_parent ON execution_tasks(parent_task_id)");
+    this.backfillExecutionTaskControlState();
+  }
+
+  private rebuildMessagesTable(): void {
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec(`
+        CREATE TABLE messages_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          from_agent TEXT NOT NULL,
+          to_agent TEXT NOT NULL,
+          subject TEXT NOT NULL DEFAULT '',
+          body TEXT,
+          type TEXT NOT NULL CHECK(type IN ('status','worker_notification')),
+          priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('low','normal','high','urgent')),
+          thread_id TEXT,
+          payload TEXT,
+          run_id TEXT REFERENCES runs(id),
+          read INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+
+      this.db.exec(`
+        INSERT INTO messages_new (id, from_agent, to_agent, subject, body, type, priority, thread_id, payload, run_id, read, created_at)
+        SELECT
+          id,
+          from_agent,
+          to_agent,
+          subject,
+          body,
+          CASE
+            WHEN type = 'worker_notification' THEN 'worker_notification'
+            ELSE 'status'
+          END,
+          priority,
+          thread_id,
+          payload,
+          run_id,
+          read,
+          created_at
+        FROM messages;
+      `);
+
+      this.db.exec("DROP TABLE messages");
+      this.db.exec("ALTER TABLE messages_new RENAME TO messages");
+      this.db.exec(messageIndexSql());
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  private rebuildArtifactsTable(): void {
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec(`
+        CREATE TABLE artifacts_new (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES runs(id),
+          feature TEXT NOT NULL,
+          type TEXT NOT NULL CHECK(type IN ('plan','prompt-contract','contract','checkpoint','review-scope','review-report','grading-report','verify-report','merge-record','ship-report')),
+          path TEXT NOT NULL,
+          hash TEXT NOT NULL,
+          issue_id TEXT REFERENCES issues(id),
+          session_id TEXT REFERENCES sessions(id),
+          review_scope_id TEXT REFERENCES review_scopes(id),
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+
+      this.db.exec(`
+        INSERT INTO artifacts_new (id, run_id, feature, type, path, hash, issue_id, session_id, review_scope_id, created_at)
+        SELECT
+          id,
+          run_id,
+          feature,
+          type,
+          path,
+          hash,
+          issue_id,
+          session_id,
+          review_scope_id,
+          created_at
+        FROM artifacts;
+      `);
+
+      this.db.exec("DROP TABLE artifacts");
+      this.db.exec("ALTER TABLE artifacts_new RENAME TO artifacts");
+      this.db.exec(artifactIndexSql());
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    } finally {
+      this.db.exec("PRAGMA foreign_keys = ON");
+    }
+  }
+
+  private rebuildExecutionTasksTable(): void {
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec(`
+      CREATE TABLE execution_tasks_new (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        issue_id TEXT REFERENCES issues(id),
+        review_scope_id TEXT REFERENCES review_scopes(id),
+        parent_task_id TEXT REFERENCES execution_tasks_new(id),
+        logical_name TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('build','contract_review','implementation_review','merge','verify')),
+        capability TEXT NOT NULL CHECK(capability IN ('builder','evaluator','system','shell')),
+        executor TEXT NOT NULL CHECK(executor IN ('agent','shell','system')),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','running','blocked','completed','failed','superseded')),
+        active_session_id TEXT REFERENCES sessions(id),
+        summary TEXT,
+        output_path TEXT,
+        result_path TEXT,
+        head_sha TEXT,
+        files_modified TEXT,
+        command TEXT,
+        cwd TEXT,
+        process_id INTEGER,
+        exit_code INTEGER,
+        output_size INTEGER NOT NULL DEFAULT 0,
+        last_output_at TEXT,
+        output_offset INTEGER NOT NULL DEFAULT 0,
+        notified INTEGER NOT NULL DEFAULT 0 CHECK(notified IN (0,1)),
+        notified_at TEXT,
+        last_error TEXT,
+        control_state_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        completed_at TEXT
+      );
+    `);
+
+    const executionTaskColumns = this.db.prepare("PRAGMA table_info(execution_tasks)").all() as Array<{ name: string }>;
+    const hasParentTaskId = executionTaskColumns.some((column) => column.name === "parent_task_id");
+    const hasExecutor = executionTaskColumns.some((column) => column.name === "executor");
+    const hasResultPath = executionTaskColumns.some((column) => column.name === "result_path");
+    const hasHeadSha = executionTaskColumns.some((column) => column.name === "head_sha");
+    const hasFilesModified = executionTaskColumns.some((column) => column.name === "files_modified");
+    const hasCommand = executionTaskColumns.some((column) => column.name === "command");
+    const hasCwd = executionTaskColumns.some((column) => column.name === "cwd");
+    const hasProcessId = executionTaskColumns.some((column) => column.name === "process_id");
+    const hasExitCode = executionTaskColumns.some((column) => column.name === "exit_code");
+    const hasOutputSize = executionTaskColumns.some((column) => column.name === "output_size");
+    const hasLastOutputAt = executionTaskColumns.some((column) => column.name === "last_output_at");
+    const hasOutputOffset = executionTaskColumns.some((column) => column.name === "output_offset");
+    const hasNotified = executionTaskColumns.some((column) => column.name === "notified");
+    const hasNotifiedAt = executionTaskColumns.some((column) => column.name === "notified_at");
+    const hasControlStateJson = executionTaskColumns.some((column) => column.name === "control_state_json");
+    const selectParentTaskId = hasParentTaskId ? "parent_task_id" : "NULL AS parent_task_id";
+    const selectExecutor = hasExecutor
+      ? "executor"
+      : `CASE
+          WHEN capability = 'shell' THEN 'shell'
+          WHEN capability = 'system' THEN 'system'
+          ELSE 'agent'
+        END`;
+    const selectOutputPath = hasResultPath ? "output_path" : "NULL";
+    const selectResultPath = hasResultPath ? "result_path" : "output_path";
+    const selectHeadSha = hasHeadSha ? "head_sha" : "NULL";
+    const selectFilesModified = hasFilesModified ? "files_modified" : "NULL";
+    const selectCommand = hasCommand ? "command" : "NULL";
+    const selectCwd = hasCwd ? "cwd" : "NULL";
+    const selectProcessId = hasProcessId ? "process_id" : "NULL";
+    const selectExitCode = hasExitCode ? "exit_code" : "NULL";
+    const selectOutputSize = hasOutputSize ? "output_size" : "0";
+    const selectLastOutputAt = hasLastOutputAt ? "last_output_at" : "NULL";
+    const selectOutputOffset = hasOutputOffset ? "output_offset" : "0";
+    const selectNotified = hasNotified
+      ? "notified"
+      : `CASE
+          WHEN status IN ('completed','failed') THEN 1
+          ELSE 0
+        END`;
+    const selectNotifiedAt = hasNotifiedAt
+      ? "notified_at"
+      : `CASE
+          WHEN status IN ('completed','failed') THEN COALESCE(completed_at, datetime('now'))
+          ELSE NULL
+        END`;
+    const selectControlStateJson = hasControlStateJson ? "control_state_json" : "'{}'";
+
+    this.db.exec(`
+      INSERT INTO execution_tasks_new (
+        id, run_id, issue_id, review_scope_id, parent_task_id, logical_name, kind, capability, executor, status,
+        active_session_id, summary, output_path, result_path, head_sha, files_modified, command, cwd, process_id, exit_code, output_size, last_output_at, output_offset, notified, notified_at, last_error, control_state_json,
+        created_at, updated_at, completed_at
+      )
+      SELECT
+        id,
+        run_id,
+        issue_id,
+        review_scope_id,
+        ${selectParentTaskId},
+        logical_name,
+        kind,
+        capability,
+        ${selectExecutor},
+        CASE
+          WHEN status IN ('pending','running','blocked','completed','failed','superseded') THEN status
+          ELSE 'failed'
+        END,
+        active_session_id,
+        summary,
+        ${selectOutputPath},
+        ${selectResultPath},
+        ${selectHeadSha},
+        ${selectFilesModified},
+        ${selectCommand},
+        ${selectCwd},
+        ${selectProcessId},
+        ${selectExitCode},
+        ${selectOutputSize},
+        ${selectLastOutputAt},
+        ${selectOutputOffset},
+        ${selectNotified},
+        ${selectNotifiedAt},
+        last_error,
+        ${selectControlStateJson},
+        created_at,
+        updated_at,
+        completed_at
+      FROM execution_tasks;
+    `);
+
+    this.db.exec("DROP TABLE execution_tasks");
+    this.db.exec("ALTER TABLE execution_tasks_new RENAME TO execution_tasks");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_execution_tasks_run_status ON execution_tasks(run_id, status)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_execution_tasks_issue ON execution_tasks(issue_id)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_execution_tasks_parent ON execution_tasks(parent_task_id)");
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_tasks_run_logical ON execution_tasks(run_id, logical_name)");
+    this.backfillExecutionTaskControlState();
+    this.db.exec("PRAGMA foreign_keys = ON");
+  }
+
+  private backfillExecutionTaskControlState(): void {
+    const rows = this.db
+      .prepare(
+        `SELECT id, status, output_offset, notified, notified_at, control_state_json
+         FROM execution_tasks`,
+      )
+      .all() as Array<
+        Pick<
+          ExecutionTaskRow,
+          "id" | "status" | "output_offset" | "notified" | "notified_at" | "control_state_json"
+        >
+      >;
+
+    const update = this.db.prepare(
+      "UPDATE execution_tasks SET control_state_json = ? WHERE id = ?",
+    );
+    const backfill = this.db.transaction((tasks: typeof rows) => {
+      for (const task of tasks) {
+        let shouldBackfill = true;
+        if (task.control_state_json) {
+          try {
+            shouldBackfill = !ExecutionTaskControlStateSchema.safeParse(
+              JSON.parse(task.control_state_json),
+            ).success;
+          } catch {
+            shouldBackfill = true;
+          }
+        }
+        if (!shouldBackfill) {
+          continue;
+        }
+
+        const nextState = deriveExecutionTaskControlStateFromMutation(
+          {
+            ...task,
+            control_state_json: "",
+          },
+          {
+            status: task.status,
+            output_offset: task.output_offset,
+            notified: task.notified,
+            notified_at: task.notified_at,
+          },
+          task.notified_at ?? now(),
+        );
+        update.run(
+          serializeExecutionTaskControlState(nextState),
+          task.id,
+        );
+      }
+    });
+
+    backfill(rows);
   }
 
   close(): void {

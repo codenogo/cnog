@@ -69,6 +69,18 @@ describe("buildHooksConfig", () => {
     });
     expect(config.hooks.PreToolUse).toBeUndefined();
   });
+
+  it("uses runtime progress updates in the PostToolUse hook", () => {
+    const config = buildHooksConfig({
+      capability: "builder",
+      agentName: "builder-1",
+      worktreePath: tmpDir,
+    });
+    expect(config.hooks.PostToolUse).toHaveLength(1);
+    expect(config.hooks.PostToolUse![0].command).toContain("cnog progress update");
+    expect(config.hooks.PostToolUse![0].command).toContain("--quiet");
+    expect(config.hooks.PostToolUse![0].command).toContain("CLAUDE_TOOL_NAME");
+  });
 });
 
 describe("deployHooks", () => {

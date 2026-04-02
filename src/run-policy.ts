@@ -1,6 +1,14 @@
 import type { CnogDB } from "./db.js";
 import type { MemoryEngine } from "./memory.js";
 import { ContractManager } from "./contracts.js";
+import {
+  blockedExecutionTaskReason,
+  findBlockedExecutionTask,
+  findBlockedIssueVerificationTask,
+  hasFailedScopeVerification,
+  hasInFlightRunWork,
+  hasRunningExecutionTasks,
+} from "./run-state.js";
 
 export type RunNextAction =
   | { kind: "propose_contracts"; reason: string }
@@ -9,16 +17,6 @@ export type RunNextAction =
   | { kind: "spawn_implementation_evaluator"; reason: string }
   | { kind: "idle"; reason: string }
   | { kind: "blocked"; reason: string };
-
-function hasActiveSessions(db: CnogDB, runId: string, capability?: string): boolean {
-  return db.sessions
-    .list({ run_id: runId })
-    .some((session) => (
-      (!capability || session.capability === capability)
-      && session.state !== "completed"
-      && session.state !== "failed"
-    ));
-}
 
 export function decideNextRunAction(opts: {
   runId: string;
@@ -43,7 +41,15 @@ export function decideNextRunAction(opts: {
   }
 
   if (run.status === "contract") {
-    if (hasActiveSessions(opts.db, run.id, "evaluator")) {
+    const blockedContractReview = findBlockedExecutionTask(opts.db, run.id, {
+      capability: "evaluator",
+      kind: "contract_review",
+    });
+    if (blockedContractReview) {
+      return { kind: "blocked", reason: blockedExecutionTaskReason(blockedContractReview) };
+    }
+
+    if (hasInFlightRunWork(opts.db, run.id, { capability: "evaluator", kind: "contract_review" })) {
       return { kind: "idle", reason: "Contract evaluator already in progress" };
     }
 
@@ -55,6 +61,10 @@ export function decideNextRunAction(opts: {
       return { kind: "spawn_contract_evaluator", reason: "Pending contracts need evaluator approval" };
     }
 
+    if (hasInFlightRunWork(opts.db, run.id, { capability: "builder", kind: "build" })) {
+      return { kind: "idle", reason: "Builder work is already in flight" };
+    }
+
     if (runnableContracts.some(({ contract }) => contract?.status === "accepted" || contract?.status === "completed")) {
       return { kind: "spawn_builders", reason: "Accepted contracts are ready for builder execution" };
     }
@@ -63,7 +73,16 @@ export function decideNextRunAction(opts: {
   }
 
   if (run.status === "build") {
-    if (hasActiveSessions(opts.db, run.id)) {
+    const blockedBuildVerify = findBlockedIssueVerificationTask(opts.db, run.id);
+    if (blockedBuildVerify) {
+      return { kind: "blocked", reason: blockedExecutionTaskReason(blockedBuildVerify) };
+    }
+
+    if (hasRunningExecutionTasks(opts.db, run.id, { kind: "verify" })) {
+      return { kind: "idle", reason: "Post-build verification is already in progress" };
+    }
+
+    if (hasInFlightRunWork(opts.db, run.id, { capability: "builder", kind: "build" })) {
       return { kind: "idle", reason: "Build work is already in flight" };
     }
 
@@ -81,11 +100,47 @@ export function decideNextRunAction(opts: {
       return { kind: "idle", reason: "Build work is complete and no pending merge scope remains" };
     }
 
+    const blockedBuild = findBlockedExecutionTask(opts.db, run.id, {
+      capability: "builder",
+      kind: "build",
+    });
+    if (blockedBuild) {
+      return { kind: "blocked", reason: blockedExecutionTaskReason(blockedBuild) };
+    }
+
     return { kind: "blocked", reason: "Run has unresolved issues but no ready accepted work" };
   }
 
   if (run.status === "evaluate") {
-    if (hasActiveSessions(opts.db, run.id, "evaluator")) {
+    const activeScope = opts.db.reviewScopes.activeForRun(run.id);
+
+    if (hasRunningExecutionTasks(opts.db, run.id, { kind: "verify" })) {
+      return { kind: "idle", reason: "Review-scope verification is already in progress" };
+    }
+
+    if (hasFailedScopeVerification(opts.db, run.id)) {
+      return { kind: "blocked", reason: "Review-scope verification failed" };
+    }
+
+    if (activeScope) {
+      const blockedScopeVerification = findBlockedExecutionTask(opts.db, run.id, {
+        kind: "verify",
+        reviewScopeId: activeScope.id,
+      });
+      if (blockedScopeVerification) {
+        return { kind: "blocked", reason: blockedExecutionTaskReason(blockedScopeVerification) };
+      }
+    }
+
+    const blockedImplementationReview = findBlockedExecutionTask(opts.db, run.id, {
+      capability: "evaluator",
+      kind: "implementation_review",
+    });
+    if (blockedImplementationReview) {
+      return { kind: "blocked", reason: blockedExecutionTaskReason(blockedImplementationReview) };
+    }
+
+    if (hasInFlightRunWork(opts.db, run.id, { capability: "evaluator", kind: "implementation_review" })) {
       return { kind: "idle", reason: "Implementation evaluator already in progress" };
     }
 

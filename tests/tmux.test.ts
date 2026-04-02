@@ -16,6 +16,8 @@ import {
   sendKeys,
   killSession,
   capturePane,
+  pipePaneToFiles,
+  pipePaneToFile,
   getPanePid,
   sessionNameFor,
   TMUX_SOCKET,
@@ -389,6 +391,69 @@ describe("capturePane", () => {
         "cnog-builder",
         "-p",
         "-S-100",
+      ],
+      expect.objectContaining({ encoding: "utf-8" }),
+    );
+  });
+});
+
+describe("pipePaneToFile", () => {
+  it("configures tmux pipe-pane for transcript capture", () => {
+    mockSpawnSync.mockReturnValue({
+      status: 0,
+      stdout: "",
+      stderr: "",
+      error: undefined,
+    });
+
+    expect(pipePaneToFile("cnog-builder", "/tmp/cnog/builder auth.log")).toBe(true);
+    expect(mockSpawnSync).toHaveBeenCalledWith(
+      "tmux",
+      [
+        "-L",
+        TMUX_SOCKET,
+        "pipe-pane",
+        "-o",
+        "-t",
+        "cnog-builder",
+        "cat >> '/tmp/cnog/builder auth.log'",
+      ],
+      expect.objectContaining({ encoding: "utf-8" }),
+    );
+  });
+
+  it("returns false when pipe-pane fails", () => {
+    mockSpawnSync.mockReturnValue({
+      status: 1,
+      stdout: "",
+      stderr: "session not found",
+      error: undefined,
+    });
+
+    expect(pipePaneToFile("cnog-missing", "/tmp/missing.log")).toBe(false);
+  });
+});
+
+describe("pipePaneToFiles", () => {
+  it("configures tmux pipe-pane with tee for multiple task sinks", () => {
+    mockSpawnSync.mockReturnValue({
+      status: 0,
+      stdout: "",
+      stderr: "",
+      error: undefined,
+    });
+
+    expect(pipePaneToFiles("cnog-builder", ["/tmp/transcript.log", "/tmp/task.output"])).toBe(true);
+    expect(mockSpawnSync).toHaveBeenCalledWith(
+      "tmux",
+      [
+        "-L",
+        TMUX_SOCKET,
+        "pipe-pane",
+        "-o",
+        "-t",
+        "cnog-builder",
+        "tee -a '/tmp/transcript.log' '/tmp/task.output' >/dev/null",
       ],
       expect.objectContaining({ encoding: "utf-8" }),
     );

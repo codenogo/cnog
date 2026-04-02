@@ -195,6 +195,40 @@ export function capturePane(
   return result.stdout;
 }
 
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+/**
+ * Persist pane output to one or more files.
+ */
+export function pipePaneToFiles(sessionName: string, outputPaths: string[]): boolean {
+  const uniquePaths = [...new Set(outputPaths.filter((path) => path.length > 0))];
+  if (uniquePaths.length === 0) {
+    return false;
+  }
+
+  const command = uniquePaths.length === 1
+    ? `cat >> ${shellEscape(uniquePaths[0])}`
+    : `tee -a ${uniquePaths.map((path) => shellEscape(path)).join(" ")} >/dev/null`;
+  const result = _tmux(
+    "pipe-pane",
+    "-o",
+    "-t",
+    sessionName,
+    command,
+  );
+
+  return result.status === 0;
+}
+
+/**
+ * Persist pane output to a transcript file.
+ */
+export function pipePaneToFile(sessionName: string, transcriptPath: string): boolean {
+  return pipePaneToFiles(sessionName, [transcriptPath]);
+}
+
 /**
  * Generate tmux session name from agent name.
  */

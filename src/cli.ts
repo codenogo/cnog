@@ -9,32 +9,77 @@ import yargs from "yargs";
 import chalk from "chalk";
 import { ZodError } from "zod";
 
-import { initCommand } from "./commands/init.js";
-import { doctorCommand } from "./commands/doctor.js";
-import { statusCommand } from "./commands/status.js";
-import { startCommand, stopCommand, logsCommand as orchLogsCommand } from "./commands/orchestrator.js";
-import {
-  slingCommand, agentsListCommand, spawnCommand, stopAgentCommand,
-  inspectCommand, nudgeCommand, heartbeatCommand, evaluateCommand,
-} from "./commands/agents.js";
-import { mailSendCommand, mailCheckCommand, mailListCommand } from "./commands/mail.js";
-import { phaseGetCommand, phaseAdvanceCommand, phaseListCommand, shipCommand, runResetCommand } from "./commands/lifecycle.js";
-import {
-  memoryCreateCommand, memoryShowCommand, memoryListCommand,
-  memoryReadyCommand, memoryClaimCommand, memoryCloseCommand, memoryStatsCommand,
-} from "./commands/memory.js";
-import { planCommand, shapeCommand, mergeCommand } from "./commands/planning.js";
-import {
-  dashboardCommand, feedCommand, logsCommand, costsCommand,
-  checkpointSaveCommand, checkpointShowCommand, progressCommand, handoffsCommand,
-  contractShowCommand, contractAcceptCommand, contractRejectCommand, gradeCommand,
-} from "./commands/observability.js";
-import { runListCommand, runShowCommand } from "./commands/lifecycle.js";
 import { CnogError } from "./errors.js";
 
-export function main(args: string[]): void {
+function lazyCommand(loader: () => Promise<Record<string, unknown>>, key: string) {
+  return async (...args: unknown[]): Promise<void> => {
+    const mod = await loader();
+    const handler = mod[key];
+    if (typeof handler !== "function") {
+      throw new Error(`Command export ${key} was not found.`);
+    }
+    await (handler as (...innerArgs: unknown[]) => unknown)(...args);
+  };
+}
+
+const initCommand = lazyCommand(() => import("./commands/init.js"), "initCommand");
+const doctorCommand = lazyCommand(() => import("./commands/doctor.js"), "doctorCommand");
+const statusCommand = lazyCommand(() => import("./commands/status.js"), "statusCommand");
+const startCommand = lazyCommand(() => import("./commands/orchestrator.js"), "startCommand");
+const stopCommand = lazyCommand(() => import("./commands/orchestrator.js"), "stopCommand");
+const orchLogsCommand = lazyCommand(() => import("./commands/orchestrator.js"), "logsCommand");
+const slingCommand = lazyCommand(() => import("./commands/agents.js"), "slingCommand");
+const agentsListCommand = lazyCommand(() => import("./commands/agents.js"), "agentsListCommand");
+const spawnCommand = lazyCommand(() => import("./commands/agents.js"), "spawnCommand");
+const stopAgentCommand = lazyCommand(() => import("./commands/agents.js"), "stopAgentCommand");
+const inspectCommand = lazyCommand(() => import("./commands/agents.js"), "inspectCommand");
+const nudgeCommand = lazyCommand(() => import("./commands/agents.js"), "nudgeCommand");
+const heartbeatCommand = lazyCommand(() => import("./commands/agents.js"), "heartbeatCommand");
+const evaluateCommand = lazyCommand(() => import("./commands/agents.js"), "evaluateCommand");
+const mailSendCommand = lazyCommand(() => import("./commands/mail.js"), "mailSendCommand");
+const mailCheckCommand = lazyCommand(() => import("./commands/mail.js"), "mailCheckCommand");
+const mailListCommand = lazyCommand(() => import("./commands/mail.js"), "mailListCommand");
+const reportBlockedCommand = lazyCommand(() => import("./commands/mail.js"), "reportBlockedCommand");
+const reportBuilderCompleteCommand = lazyCommand(() => import("./commands/mail.js"), "reportBuilderCompleteCommand");
+const reportContractReviewCommand = lazyCommand(() => import("./commands/mail.js"), "reportContractReviewCommand");
+const reportGenericCompleteCommand = lazyCommand(() => import("./commands/mail.js"), "reportGenericCompleteCommand");
+const reportImplementationReviewCommand = lazyCommand(() => import("./commands/mail.js"), "reportImplementationReviewCommand");
+const reportPlannerCompleteCommand = lazyCommand(() => import("./commands/mail.js"), "reportPlannerCompleteCommand");
+const phaseGetCommand = lazyCommand(() => import("./commands/lifecycle.js"), "phaseGetCommand");
+const phaseAdvanceCommand = lazyCommand(() => import("./commands/lifecycle.js"), "phaseAdvanceCommand");
+const phaseListCommand = lazyCommand(() => import("./commands/lifecycle.js"), "phaseListCommand");
+const shipCommand = lazyCommand(() => import("./commands/lifecycle.js"), "shipCommand");
+const runResetCommand = lazyCommand(() => import("./commands/lifecycle.js"), "runResetCommand");
+const runListCommand = lazyCommand(() => import("./commands/lifecycle.js"), "runListCommand");
+const runShowCommand = lazyCommand(() => import("./commands/lifecycle.js"), "runShowCommand");
+const memoryCreateCommand = lazyCommand(() => import("./commands/memory.js"), "memoryCreateCommand");
+const memoryShowCommand = lazyCommand(() => import("./commands/memory.js"), "memoryShowCommand");
+const memoryListCommand = lazyCommand(() => import("./commands/memory.js"), "memoryListCommand");
+const memoryReadyCommand = lazyCommand(() => import("./commands/memory.js"), "memoryReadyCommand");
+const memoryClaimCommand = lazyCommand(() => import("./commands/memory.js"), "memoryClaimCommand");
+const memoryCloseCommand = lazyCommand(() => import("./commands/memory.js"), "memoryCloseCommand");
+const memoryStatsCommand = lazyCommand(() => import("./commands/memory.js"), "memoryStatsCommand");
+const planCommand = lazyCommand(() => import("./commands/planning.js"), "planCommand");
+const shapeCommand = lazyCommand(() => import("./commands/planning.js"), "shapeCommand");
+const mergeCommand = lazyCommand(() => import("./commands/planning.js"), "mergeCommand");
+const dashboardCommand = lazyCommand(() => import("./commands/observability.js"), "dashboardCommand");
+const feedCommand = lazyCommand(() => import("./commands/observability.js"), "feedCommand");
+const logsCommand = lazyCommand(() => import("./commands/observability.js"), "logsCommand");
+const costsCommand = lazyCommand(() => import("./commands/observability.js"), "costsCommand");
+const checkpointSaveCommand = lazyCommand(() => import("./commands/observability.js"), "checkpointSaveCommand");
+const checkpointShowCommand = lazyCommand(() => import("./commands/observability.js"), "checkpointShowCommand");
+const progressCommand = lazyCommand(() => import("./commands/observability.js"), "progressCommand");
+const handoffsCommand = lazyCommand(() => import("./commands/observability.js"), "handoffsCommand");
+const runtimeProgressShowCommand = lazyCommand(() => import("./commands/observability.js"), "runtimeProgressShowCommand");
+const runtimeProgressUpdateCommand = lazyCommand(() => import("./commands/observability.js"), "runtimeProgressUpdateCommand");
+const contractShowCommand = lazyCommand(() => import("./commands/observability.js"), "contractShowCommand");
+const contractAcceptCommand = lazyCommand(() => import("./commands/observability.js"), "contractAcceptCommand");
+const contractRejectCommand = lazyCommand(() => import("./commands/observability.js"), "contractRejectCommand");
+const gradeCommand = lazyCommand(() => import("./commands/observability.js"), "gradeCommand");
+
+export async function main(args: string[]): Promise<void> {
   try {
-    yargs(args)
+    await yargs(args)
       .scriptName("cnog")
       .version("2.0.0-alpha.1")
       .usage("$0 <command> [options]")
@@ -53,8 +98,16 @@ export function main(args: string[]): void {
       .command("dashboard", "Live terminal dashboard", {}, () => dashboardCommand())
 
       // Orchestrator
-      .command("start", "Start orchestrator", {}, () => startCommand())
+      .command({
+        command: "start",
+        describe: "Start orchestrator",
+        builder: (y) => y.option("foreground", { type: "boolean", default: false }),
+        handler: (argv) => {
+          startCommand({ foreground: Boolean(argv.foreground) });
+        },
+      })
       .command("stop", "Stop orchestrator", {}, () => stopCommand())
+      .command("orchestrator-logs", "Show orchestrator daemon log", {}, () => orchLogsCommand())
 
       // Feature workflow
       .command("sling <feature>", "Dispatch agents for a feature",
@@ -137,6 +190,30 @@ export function main(args: string[]): void {
         (y) => y.positional("name", { type: "string", demandOption: true }),
         (argv) => heartbeatCommand(argv.name!))
 
+      .command("progress", "Runtime progress tracking", (y) => y
+        .command("update <agent>", "Record runtime progress",
+          (y2) => y2.positional("agent", { type: "string", demandOption: true })
+            .option("tool", { type: "string" })
+            .option("target", { type: "string" })
+            .option("input-tokens", { type: "number" })
+            .option("output-tokens", { type: "number" })
+            .option("cost-usd", { type: "number" })
+            .option("quiet", { type: "boolean", default: false }),
+          (argv) => runtimeProgressUpdateCommand({
+            agent: argv.agent!,
+            tool: argv.tool,
+            target: argv.target,
+            inputTokens: argv.inputTokens,
+            outputTokens: argv.outputTokens,
+            costUsd: argv.costUsd,
+            quiet: argv.quiet,
+          }))
+        .command("show <agent>", "Show runtime progress",
+          (y2) => y2.positional("agent", { type: "string", demandOption: true })
+            .option("json", { type: "boolean", default: false }),
+          (argv) => runtimeProgressShowCommand(argv.agent!, { json: argv.json }))
+        .demandCommand(1))
+
       // Mail
       .command("mail", "Inter-agent messaging", (y) => y
         .command("send <to> <subject>", "Send a message",
@@ -158,6 +235,83 @@ export function main(args: string[]): void {
         .command("list", "List messages",
           (y2) => y2.option("agent", { type: "string", default: "orchestrator" }).option("limit", { type: "number", default: 20 }),
           (argv) => mailListCommand(argv.agent!, argv.limit))
+        .demandCommand(1))
+
+      .command("report", "Structured worker reporting", (y) => y
+        .command("builder-complete", "Report builder completion",
+          (y2) => y2.option("summary", { type: "string", demandOption: true })
+            .option("agent", { type: "string" })
+            .option("head-sha", { type: "string" })
+            .option("files", { type: "string" }),
+          (argv) => reportBuilderCompleteCommand({
+            summary: argv.summary!,
+            agent: argv.agent,
+            headSha: argv.headSha,
+            files: argv.files,
+          }))
+        .command("planner-complete", "Report planner completion",
+          (y2) => y2.option("summary", { type: "string", demandOption: true })
+            .option("plan-path", { type: "string", demandOption: true })
+            .option("task-count", { type: "number", demandOption: true })
+            .option("plan-hash", { type: "string" })
+            .option("agent", { type: "string" }),
+          (argv) => reportPlannerCompleteCommand({
+            summary: argv.summary!,
+            planPath: argv.planPath!,
+            taskCount: argv.taskCount!,
+            planHash: argv.planHash,
+            agent: argv.agent,
+          }))
+        .command("generic-complete", "Report generic completion",
+          (y2) => y2.option("summary", { type: "string", demandOption: true })
+            .option("role", { type: "string", demandOption: true })
+            .option("agent", { type: "string" }),
+          (argv) => reportGenericCompleteCommand({
+            summary: argv.summary!,
+            role: argv.role!,
+            agent: argv.agent,
+          }))
+        .command("contract-review", "Report contract review decisions",
+          (y2) => y2.option("summary", { type: "string", demandOption: true })
+            .option("decisions", { type: "string", demandOption: true })
+            .option("agent", { type: "string" }),
+          (argv) => reportContractReviewCommand({
+            summary: argv.summary!,
+            decisions: argv.decisions!,
+            agent: argv.agent,
+          }))
+        .command("implementation-review", "Report implementation review verdict",
+          (y2) => y2.option("summary", { type: "string", demandOption: true })
+            .option("verdict", { type: "string", demandOption: true })
+            .option("scores", { type: "string", demandOption: true })
+            .option("rework-phase", { type: "string" })
+            .option("scope-id", { type: "string" })
+            .option("scope-hash", { type: "string" })
+            .option("agent", { type: "string" }),
+          (argv) => reportImplementationReviewCommand({
+            summary: argv.summary!,
+            verdict: argv.verdict!,
+            scores: argv.scores!,
+            reworkPhase: argv.reworkPhase,
+            scopeId: argv.scopeId,
+            scopeHash: argv.scopeHash,
+            agent: argv.agent,
+          }))
+        .command("blocked", "Report blocked worker state",
+          (y2) => y2.option("summary", { type: "string", demandOption: true })
+            .option("code", { type: "string", demandOption: true })
+            .option("role", { type: "string", demandOption: true })
+            .option("evidence", { type: "string" })
+            .option("requested-action", { type: "string" })
+            .option("agent", { type: "string" }),
+          (argv) => reportBlockedCommand({
+            summary: argv.summary!,
+            code: argv.code!,
+            role: argv.role!,
+            evidence: argv.evidence,
+            requestedAction: argv.requestedAction,
+            agent: argv.agent,
+          }))
         .demandCommand(1))
 
       // Lifecycle
@@ -258,7 +412,7 @@ export function main(args: string[]): void {
       .demandCommand(1, "Run cnog --help for available commands")
       .strict()
       .help()
-      .parse();
+      .parseAsync();
   } catch (err) {
     if (err instanceof CnogError) {
       console.error(chalk.red(err.message));

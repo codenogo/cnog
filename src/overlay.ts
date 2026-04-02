@@ -14,6 +14,16 @@ import { join, dirname } from "node:path";
 import type { SprintContract, GradingRubric } from "./types.js";
 import { renderContractForOverlay } from "./contracts.js";
 import { renderRubricForOverlay } from "./grading.js";
+import {
+  renderContextBundleMarkdown,
+  type WorkerContextBundle,
+} from "./context-builder.js";
+import {
+  renderAssignmentSpecMarkdown,
+  renderProtocolContractMarkdown,
+  type WorkerAssignmentSpec,
+  type WorkerProtocolContract,
+} from "./prompt-contract.js";
 
 /**
  * Load a base agent definition from agents/<capability>.md.
@@ -33,32 +43,15 @@ export function loadBaseDefinition(
  * Generate the full runtime instruction content for an agent.
  */
 export function generateOverlay(opts: {
-  agentName: string;
-  capability: string;
-  feature: string;
-  branch?: string;
-  taskId?: string;
-  taskPrompt: string;
-  runId?: string;
-  fileScope?: string[];
-  verifyCommands?: string[];
+  protocol: WorkerProtocolContract;
+  assignment: WorkerAssignmentSpec;
   agentsDir?: string;
   contract?: SprintContract;
   rubric?: GradingRubric;
   handoffContext?: string;
-  completionCommand?: string;
+  context?: WorkerContextBundle;
 }): string {
-  const base = loadBaseDefinition(opts.capability, opts.agentsDir);
-
-  const fileScopeSection =
-    opts.fileScope && opts.fileScope.length > 0
-      ? `## File Scope\n${opts.fileScope.map((f) => `- ${f}`).join("\n")}`
-      : "";
-
-  const verifySection =
-    opts.verifyCommands && opts.verifyCommands.length > 0
-      ? `## Verify Commands\n${opts.verifyCommands.map((c) => `- \`${c}\``).join("\n")}`
-      : "";
+  const base = loadBaseDefinition(opts.protocol.role, opts.agentsDir);
 
   const contractSection =
     opts.contract ? `\n${renderContractForOverlay(opts.contract)}\n` : "";
@@ -70,37 +63,36 @@ export function generateOverlay(opts: {
     opts.handoffContext
       ? `\n## Previous Session Context\nThis is a context reset. A previous agent worked on this task. Here is their progress:\n\n${opts.handoffContext}\n`
       : "";
+  const layeredContextSection =
+    opts.context ? `\n${renderContextBundleMarkdown(opts.context)}\n` : "";
 
-  const completionCommand = opts.completionCommand ?? (opts.capability === "evaluator"
-    ? `cnog mail send orchestrator "evaluate: <VERDICT>" --from ${opts.agentName} --type result --payload '{"scores":[{"criterion":"functionality","score":0.0,"feedback":"..."}]}'`
-    : `cnog mail send orchestrator "done" --from ${opts.agentName} --type worker_done${opts.branch ? ` --payload '{"feature":"${opts.feature}","branch":"${opts.branch}"}'` : ""}`);
+  return `# cnog Worker Contract
 
-  return `# Task: ${opts.taskId ?? "unassigned"}
+## Identity
+- Agent: ${opts.protocol.agentName}
+- Role: ${opts.protocol.role}
+- Feature: ${opts.protocol.feature}
+- Run: ${opts.protocol.runId}
+${opts.protocol.branch ? `- Branch: ${opts.protocol.branch}` : ""}
+${opts.protocol.executionTaskId ? `- Execution Task: ${opts.protocol.executionTaskId}` : ""}
+${opts.protocol.issueId ? `- Issue: ${opts.protocol.issueId}` : ""}
+${opts.protocol.reviewScopeId ? `- Review Scope: ${opts.protocol.reviewScopeId}` : ""}
 
-## Your Identity
-- Agent: ${opts.agentName}
-- Capability: ${opts.capability}
-- Feature: ${opts.feature}
-- Branch: ${opts.branch ?? "unassigned"}
-${opts.runId ? `- Run: ${opts.runId}` : ""}
+${renderProtocolContractMarkdown(opts.protocol)}
 
-## Task
-${opts.taskPrompt}
-
-${fileScopeSection}
-
-${verifySection}
+${layeredContextSection}
+${renderAssignmentSpecMarkdown(opts.assignment)}
 ${contractSection}
 ${rubricSection}
 ${handoffSection}
-## Communication
-- Report completion: \`${completionCommand}\`
-- Report errors: \`cnog mail send orchestrator "blocked on X" --from ${opts.agentName} --type escalation\`
-- Check messages: \`cnog mail check --agent ${opts.agentName}\`
-- Send heartbeat: \`cnog heartbeat ${opts.agentName}\`
-- Save checkpoint: \`cnog checkpoint save --agent ${opts.agentName} --summary "what you did" --pending "what remains"\`
+## Communication Commands
+- Check messages: \`cnog mail check --agent ${opts.protocol.agentName}\`
+- Send heartbeat: \`cnog heartbeat ${opts.protocol.agentName}\`
+- Completion command: \`${opts.protocol.completionCommand}\`
+- Escalation command: \`${opts.protocol.escalationCommand}\`
+- Checkpoint command: \`${opts.protocol.checkpointCommand}\`
 
-## Base Instructions
+## Role Charter
 ${base}
 `.trim() + "\n";
 }

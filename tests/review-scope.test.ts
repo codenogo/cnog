@@ -7,6 +7,8 @@ import { Lifecycle } from "../src/lifecycle.js";
 import { computeScopeHash, buildReviewScope, applyEvaluationResult } from "../src/review.js";
 import { ContractManager, generateContract } from "../src/contracts.js";
 import { EventEmitter } from "../src/events.js";
+import { MemoryEngine } from "../src/memory.js";
+import { decideNextRunAction } from "../src/run-policy.js";
 
 let db: CnogDB;
 let tmpDir: string;
@@ -25,7 +27,7 @@ function setup() {
 function createSession(name: string) {
   db.sessions.create({
     id: `sid-${name}`, name, logical_name: name, attempt: 1, runtime: "claude",
-    capability: "builder", feature: FEATURE, task_id: null, worktree_path: null,
+    capability: "builder", feature: FEATURE, task_id: null, worktree_path: null, transcript_path: null,
     branch: `cnog/${FEATURE}/${name}`, tmux_session: null, pid: null, state: "completed",
     parent_agent: null, run_id: RUN_ID,
   });
@@ -114,7 +116,7 @@ describe("ReviewScopeStore", () => {
     db.sessions.create({
       id: evalSid, name: "evaluator-verdict", logical_name: "evaluator-verdict", attempt: 1,
       runtime: "claude", capability: "evaluator", feature: FEATURE, task_id: null,
-      worktree_path: null, branch: null, tmux_session: null, pid: null,
+      worktree_path: null, transcript_path: null, branch: null, tmux_session: null, pid: null,
       state: "working", parent_agent: null, run_id: RUN_ID,
     });
 
@@ -131,13 +133,13 @@ describe("ReviewScopeStore", () => {
     db.sessions.create({
       id: "sid-e1", name: "evaluator-e1", logical_name: "evaluator-e1", attempt: 1,
       runtime: "claude", capability: "evaluator", feature: FEATURE, task_id: null,
-      worktree_path: null, branch: null, tmux_session: null, pid: null,
+      worktree_path: null, transcript_path: null, branch: null, tmux_session: null, pid: null,
       state: "working", parent_agent: null, run_id: RUN_ID,
     });
     db.sessions.create({
       id: "sid-e2", name: "evaluator-e2", logical_name: "evaluator-e2", attempt: 1,
       runtime: "claude", capability: "evaluator", feature: FEATURE, task_id: null,
-      worktree_path: null, branch: null, tmux_session: null, pid: null,
+      worktree_path: null, transcript_path: null, branch: null, tmux_session: null, pid: null,
       state: "working", parent_agent: null, run_id: RUN_ID,
     });
 
@@ -186,7 +188,7 @@ describe("ReviewScopeStore", () => {
     db.sessions.create({
       id: "sid-e-hash", name: "evaluator-hash", logical_name: "evaluator-hash", attempt: 1,
       runtime: "claude", capability: "evaluator", feature: FEATURE, task_id: null,
-      worktree_path: null, branch: null, tmux_session: null, pid: null,
+      worktree_path: null, transcript_path: null, branch: null, tmux_session: null, pid: null,
       state: "working", parent_agent: null, run_id: RUN_ID,
     });
     db.reviewScopes.create({
@@ -263,7 +265,7 @@ describe("ReviewAttemptStore", () => {
     db.sessions.create({
       id: "sid-eval-att", name: "evaluator-att", logical_name: "evaluator-att", attempt: 1,
       runtime: "claude", capability: "evaluator", feature: FEATURE, task_id: null,
-      worktree_path: null, branch: null, tmux_session: null, pid: null,
+      worktree_path: null, transcript_path: null, branch: null, tmux_session: null, pid: null,
       state: "working", parent_agent: null, run_id: RUN_ID,
     });
 
@@ -310,6 +312,7 @@ describe("ReviewAttemptStore", () => {
       feature: FEATURE,
       task_id: null,
       worktree_path: null,
+      transcript_path: null,
       branch: "main",
       tmux_session: null,
       pid: null,
@@ -323,16 +326,21 @@ describe("ReviewAttemptStore", () => {
       sessionId: "eval-session",
       sessionName: "evaluator-1",
       feature: FEATURE,
-      message: {
-        subject: "review: APPROVE",
-        payload: {
-          scores: [
-            { criterion: "functionality", score: 1, feedback: "ok" },
-            { criterion: "completeness", score: 1, feedback: "ok" },
-            { criterion: "code_quality", score: 1, feedback: "ok" },
-            { criterion: "test_coverage", score: 1, feedback: "ok" },
-          ],
-        },
+      payload: {
+        protocolVersion: 1,
+        kind: "implementation_review",
+        runId: RUN_ID,
+        feature: FEATURE,
+        scopeId: "scope-eval",
+        scopeHash: "scope-hash",
+        verdict: "APPROVE",
+        summary: "All review criteria passed",
+        scores: [
+          { criterion: "functionality", score: 1, feedback: "ok" },
+          { criterion: "completeness", score: 1, feedback: "ok" },
+          { criterion: "code_quality", score: 1, feedback: "ok" },
+          { criterion: "test_coverage", score: 1, feedback: "ok" },
+        ],
       },
       db,
       events,
@@ -352,5 +360,240 @@ describe("ReviewAttemptStore", () => {
     expect(gradingArtifacts).toHaveLength(1);
     expect(reviewArtifacts[0].review_scope_id).toBe("scope-eval");
     expect(gradingArtifacts[0].review_scope_id).toBe("scope-eval");
+  });
+
+  it("reopens scoped issues and retires pending merge scope on REQUEST_CHANGES", () => {
+    const events = new EventEmitter(db);
+    const lifecycle = new Lifecycle(db, events, tmpDir);
+    const memory = new MemoryEngine(db);
+    const issueId = "cn-rework";
+    const sessionId = createSession("builder-rework");
+
+    db.issues.create({
+      id: issueId,
+      title: "rework task",
+      description: null,
+      issue_type: "task",
+      status: "done",
+      priority: 1,
+      assignee: "builder-rework",
+      feature: FEATURE,
+      run_id: RUN_ID,
+      plan_number: null,
+      phase: "build",
+      parent_id: null,
+      metadata: null,
+    });
+    createAcceptedContract(issueId);
+
+    const mergeId = db.merges.enqueue({
+      feature: FEATURE,
+      branch: `cnog/${FEATURE}/builder-rework`,
+      agent_name: "builder-rework",
+      run_id: RUN_ID,
+      session_id: sessionId,
+      task_id: issueId,
+      head_sha: "abc123",
+      files_modified: null,
+    });
+    const scopeHash = computeScopeHash({
+      mergeEntryIds: [mergeId],
+      branches: [`cnog/${FEATURE}/builder-rework`],
+      headShas: ["abc123"],
+      contractIds: db.artifacts.listByIssue(issueId).filter((artifact) => artifact.type === "contract").map((artifact) => artifact.id),
+      contractHashes: db.artifacts.listByIssue(issueId).filter((artifact) => artifact.type === "contract").map((artifact) => artifact.hash),
+      verifyCommands: ["npm test"],
+    });
+
+    db.reviewScopes.create({
+      id: "scope-rework-build",
+      run_id: RUN_ID,
+      scope_status: "evaluating",
+      scope_hash: scopeHash,
+      merge_entries: JSON.stringify([mergeId]),
+      branches: JSON.stringify([`cnog/${FEATURE}/builder-rework`]),
+      head_shas: JSON.stringify(["abc123"]),
+      contract_ids: JSON.stringify(db.artifacts.listByIssue(issueId).filter((artifact) => artifact.type === "contract").map((artifact) => artifact.id)),
+      contract_hashes: JSON.stringify(db.artifacts.listByIssue(issueId).filter((artifact) => artifact.type === "contract").map((artifact) => artifact.hash)),
+      verify_commands: JSON.stringify(["npm test"]),
+      verdict: null,
+      evaluator_session: null,
+    });
+    db.reviewScopes.create({
+      id: "scope-old-approved",
+      run_id: RUN_ID,
+      scope_status: "approved",
+      scope_hash: "scope-old-approved-hash",
+      merge_entries: JSON.stringify([]),
+      branches: JSON.stringify([]),
+      head_shas: JSON.stringify([]),
+      contract_ids: JSON.stringify([]),
+      contract_hashes: JSON.stringify([]),
+      verify_commands: JSON.stringify([]),
+      verdict: "APPROVE",
+      evaluator_session: null,
+    });
+    db.sessions.create({
+      id: "eval-rework-build",
+      name: "evaluator-rework-build",
+      logical_name: "evaluator-rework-build",
+      attempt: 1,
+      runtime: "claude",
+      capability: "evaluator",
+      feature: FEATURE,
+      task_id: null,
+      worktree_path: null,
+      transcript_path: null,
+      branch: null,
+      tmux_session: null,
+      pid: null,
+      state: "working",
+      parent_agent: null,
+      run_id: RUN_ID,
+    });
+
+    const verdict = applyEvaluationResult({
+      runId: RUN_ID,
+      sessionId: "eval-rework-build",
+      sessionName: "evaluator-rework-build",
+      feature: FEATURE,
+      payload: {
+        kind: "implementation_review",
+        scopeId: "scope-rework-build",
+        scopeHash,
+        verdict: "REQUEST_CHANGES",
+        reworkPhase: "build",
+        scores: [
+          { criterion: "functionality", score: 0.6, feedback: "needs work" },
+          { criterion: "completeness", score: 0.6, feedback: "mostly there" },
+          { criterion: "code_quality", score: 0.6, feedback: "acceptable" },
+          { criterion: "test_coverage", score: 0.5, feedback: "missing edge cases" },
+        ],
+      },
+      summary: "Needs implementation changes",
+      db,
+      events,
+      lifecycle,
+      projectRoot: tmpDir,
+    });
+
+    expect(verdict).toBe("REQUEST_CHANGES");
+    expect(db.runs.get(RUN_ID)?.status).toBe("build");
+    expect(db.issues.get(issueId)?.status).toBe("open");
+    expect(db.issues.get(issueId)?.assignee).toBeNull();
+    expect(db.merges.listForRun(RUN_ID)[0]?.status).toBe("failed");
+    expect(db.reviewScopes.get("scope-old-approved")?.scope_status).toBe("stale");
+    expect(decideNextRunAction({ runId: RUN_ID, db, memory, projectRoot: tmpDir }).kind).not.toBe("spawn_implementation_evaluator");
+  });
+
+  it("invalidates accepted contracts when evaluation blocks scope back to contract", () => {
+    const events = new EventEmitter(db);
+    const lifecycle = new Lifecycle(db, events, tmpDir);
+    const issueId = "cn-rework-contract";
+    const sessionId = createSession("builder-contract");
+
+    db.issues.create({
+      id: issueId,
+      title: "contract rework task",
+      description: null,
+      issue_type: "task",
+      status: "done",
+      priority: 1,
+      assignee: "builder-contract",
+      feature: FEATURE,
+      run_id: RUN_ID,
+      plan_number: null,
+      phase: "build",
+      parent_id: null,
+      metadata: null,
+    });
+    createAcceptedContract(issueId);
+
+    const contractManager = new ContractManager(db, events, tmpDir);
+    const acceptedContract = contractManager.loadLatestForIssue(issueId, FEATURE);
+
+    const mergeId = db.merges.enqueue({
+      feature: FEATURE,
+      branch: `cnog/${FEATURE}/builder-contract`,
+      agent_name: "builder-contract",
+      run_id: RUN_ID,
+      session_id: sessionId,
+      task_id: issueId,
+      head_sha: "def456",
+      files_modified: null,
+    });
+    const contractArtifacts = db.artifacts.listByIssue(issueId).filter((artifact) => artifact.type === "contract");
+    const scopeHash = computeScopeHash({
+      mergeEntryIds: [mergeId],
+      branches: [`cnog/${FEATURE}/builder-contract`],
+      headShas: ["def456"],
+      contractIds: contractArtifacts.map((artifact) => artifact.id),
+      contractHashes: contractArtifacts.map((artifact) => artifact.hash),
+      verifyCommands: ["npm test"],
+    });
+
+    db.reviewScopes.create({
+      id: "scope-rework-contract",
+      run_id: RUN_ID,
+      scope_status: "evaluating",
+      scope_hash: scopeHash,
+      merge_entries: JSON.stringify([mergeId]),
+      branches: JSON.stringify([`cnog/${FEATURE}/builder-contract`]),
+      head_shas: JSON.stringify(["def456"]),
+      contract_ids: JSON.stringify(contractArtifacts.map((artifact) => artifact.id)),
+      contract_hashes: JSON.stringify(contractArtifacts.map((artifact) => artifact.hash)),
+      verify_commands: JSON.stringify(["npm test"]),
+      verdict: null,
+      evaluator_session: null,
+    });
+    db.sessions.create({
+      id: "eval-rework-contract",
+      name: "evaluator-rework-contract",
+      logical_name: "evaluator-rework-contract",
+      attempt: 1,
+      runtime: "claude",
+      capability: "evaluator",
+      feature: FEATURE,
+      task_id: null,
+      worktree_path: null,
+      transcript_path: null,
+      branch: null,
+      tmux_session: null,
+      pid: null,
+      state: "working",
+      parent_agent: null,
+      run_id: RUN_ID,
+    });
+
+    const verdict = applyEvaluationResult({
+      runId: RUN_ID,
+      sessionId: "eval-rework-contract",
+      sessionName: "evaluator-rework-contract",
+      feature: FEATURE,
+      payload: {
+        kind: "implementation_review",
+        scopeId: "scope-rework-contract",
+        scopeHash,
+        verdict: "BLOCK",
+        reworkPhase: "contract",
+        scores: [
+          { criterion: "functionality", score: 0.4, feedback: "wrong scope" },
+          { criterion: "completeness", score: 0.4, feedback: "missing contract requirements" },
+          { criterion: "code_quality", score: 0.4, feedback: "not aligned" },
+          { criterion: "test_coverage", score: 0.4, feedback: "insufficient" },
+        ],
+      },
+      summary: "Contract assumptions were wrong",
+      db,
+      events,
+      lifecycle,
+      projectRoot: tmpDir,
+    });
+
+    expect(verdict).toBe("BLOCK");
+    expect(db.runs.get(RUN_ID)?.status).toBe("contract");
+    expect(db.merges.listForRun(RUN_ID)[0]?.status).toBe("failed");
+    expect(contractManager.loadLatestForIssue(issueId, FEATURE)?.id).toBe(acceptedContract?.id);
+    expect(contractManager.loadLatestForIssue(issueId, FEATURE)?.status).toBe("failed");
   });
 });

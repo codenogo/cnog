@@ -31,7 +31,8 @@ function createTestSession(db: CnogDB, runId: string, name: string, feature: str
   const id = `sess-${name}`;
   db.sessions.create({
     id, name, logical_name: name, attempt: 1, runtime: "claude", capability: "builder",
-    feature, task_id: null, worktree_path: null, branch: `cnog/${feature}/${name}`,
+    feature, task_id: null, execution_task_id: null, worktree_path: null,
+    transcript_path: `.cnog/features/${feature}/runs/${runId}/sessions/${name}.log`, branch: `cnog/${feature}/${name}`,
     tmux_session: `cnog-${name}`, pid: 123, state: "working", parent_agent: null, run_id: runId,
   });
   return id;
@@ -64,9 +65,56 @@ describe("status and doctor snapshots", () => {
     db.runs.update(testRunId, { status: "merge", profile: "feature-delivery" });
     db.sessions.create({
       id: "sess-eval-auth", name: "evaluator-auth", logical_name: "evaluator-auth", attempt: 1,
-      runtime: "claude", capability: "evaluator", feature: "auth", task_id: null,
-      worktree_path: null, branch: null, tmux_session: null, pid: null, state: "completed",
+      runtime: "claude", capability: "evaluator", feature: "auth", task_id: null, execution_task_id: null,
+      worktree_path: null, transcript_path: null, branch: null, tmux_session: null, pid: null, state: "completed",
       parent_agent: null, run_id: testRunId,
+    });
+    db.issues.create({
+      id: "issue-auth-1",
+      title: "Implement auth builder flow",
+      description: null,
+      issue_type: "task",
+      status: "in_progress",
+      priority: 1,
+      assignee: "builder-auth",
+      feature: "auth",
+      run_id: testRunId,
+      plan_number: null,
+      phase: "build",
+      parent_id: null,
+      metadata: null,
+    });
+    db.executionTasks.create({
+      id: "xtask-auth-build",
+      run_id: testRunId,
+      issue_id: "issue-auth-1",
+      review_scope_id: null,
+      parent_task_id: null,
+      logical_name: "build:issue-auth-1",
+      kind: "build",
+      capability: "builder",
+      executor: "agent",
+      status: "running",
+      active_session_id: sessionId,
+      summary: "Implementing auth builder flow",
+      output_path: `.cnog/features/auth/runs/${testRunId}/tasks/xtask-auth-build.output`,
+      result_path: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: null,
+    });
+    db.sessionProgress.recordActivity({
+      sessionId,
+      runId: testRunId,
+      executionTaskId: "xtask-auth-build",
+      transcriptPath: `.cnog/features/auth/runs/${testRunId}/sessions/builder-auth.log`,
+      transcriptSize: 256,
+      toolName: "Write",
+      activityKind: "write",
+      summary: "Modified src/auth.ts",
+      target: "src/auth.ts",
+      at: "2026-03-26 12:00:30",
     });
     db.reviewScopes.create({
       id: "scope-auth-approved",
@@ -81,6 +129,26 @@ describe("status and doctor snapshots", () => {
       verify_commands: JSON.stringify([]),
       verdict: "APPROVE",
       evaluator_session: "sess-eval-auth",
+    });
+    db.executionTasks.create({
+      id: "xtask-auth-review",
+      run_id: testRunId,
+      issue_id: null,
+      review_scope_id: "scope-auth-approved",
+      parent_task_id: null,
+      logical_name: "implementation_review:run-auth",
+      kind: "implementation_review",
+      capability: "evaluator",
+      executor: "agent",
+      status: "completed",
+      active_session_id: null,
+      summary: "Evaluation completed with verdict APPROVE",
+      output_path: `.cnog/features/auth/runs/${testRunId}/tasks/xtask-auth-review.output`,
+      result_path: `.cnog/features/auth/runs/${testRunId}/review-report.json`,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: null,
     });
     db.merges.enqueue({
       feature: "auth",
@@ -109,6 +177,28 @@ describe("status and doctor snapshots", () => {
     const snapshot = buildStatusSnapshot(db, config, watchdog);
     expect(snapshot.summary.configuredRuntime).toBe("claude");
     expect(snapshot.agents[0].runtime).toBe("claude");
+    expect(snapshot.agents[0].toolUseCount).toBe(1);
+    expect(snapshot.agents[0].lastActivitySummary).toBe("Modified src/auth.ts");
+    expect(snapshot.agents[0].transcriptPath).toBe(`.cnog/features/auth/runs/${testRunId}/sessions/builder-auth.log`);
+    expect(snapshot.summary.activeTasks).toBe(1);
+    expect(snapshot.summary.blockedTasks).toBe(0);
+    expect(snapshot.summary.failedTasks).toBe(0);
+    expect(snapshot.tasks[0]).toMatchObject({
+      logicalName: "build:issue-auth-1",
+      issueTitle: "Implement auth builder flow",
+      status: "running",
+      selectedSession: "builder-auth",
+      selectedAttempt: 1,
+      selectedReason: "active",
+      transcriptPath: `.cnog/features/auth/runs/${testRunId}/sessions/builder-auth.log`,
+      feature: "auth",
+    });
+    expect(snapshot.tasks[1]).toMatchObject({
+      logicalName: "implementation_review:run-auth",
+      status: "completed",
+      outputPath: `.cnog/features/auth/runs/${testRunId}/tasks/xtask-auth-review.output`,
+      resultPath: `.cnog/features/auth/runs/${testRunId}/review-report.json`,
+    });
     expect(snapshot.features[0]).toMatchObject({
       feature: "auth",
       phase: "merge",
@@ -118,12 +208,58 @@ describe("status and doctor snapshots", () => {
     expect(snapshot.health[0].decision.kind).toBe("stale");
   });
 
+  it("shows blocked tasks without counting them as active work", () => {
+    db.runs.update(testRunId, { status: "evaluate" });
+    db.executionTasks.create({
+      id: "xtask-auth-blocked",
+      run_id: testRunId,
+      issue_id: null,
+      review_scope_id: null,
+      parent_task_id: null,
+      logical_name: "implementation_review:auth",
+      kind: "implementation_review",
+      capability: "evaluator",
+      executor: "agent",
+      status: "blocked",
+      active_session_id: null,
+      summary: "Blocked: waiting on external dependency",
+      output_path: `.cnog/features/auth/runs/${testRunId}/tasks/xtask-auth-blocked.output`,
+      result_path: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: "external_blocker",
+    });
+
+    const watchdog = new Watchdog(
+      db,
+      events,
+      mail,
+      60_000,
+      300_000,
+      {
+        isPidAlive: () => true,
+        isSessionAlive: () => true,
+        nowMs: () => Date.now(),
+      },
+    );
+
+    const snapshot = buildStatusSnapshot(db, config, watchdog);
+    expect(snapshot.summary.activeTasks).toBe(0);
+    expect(snapshot.summary.blockedTasks).toBe(1);
+    expect(snapshot.tasks[0]).toMatchObject({
+      logicalName: "implementation_review:auth",
+      status: "blocked",
+      lastError: "external_blocker",
+    });
+  });
+
   it("shows the active review scope status instead of an older historical verdict", () => {
     db.runs.update(testRunId, { status: "evaluate" });
     db.sessions.create({
       id: "sess-eval-auth-old", name: "evaluator-auth-old", logical_name: "evaluator-auth-old",
-      attempt: 1, runtime: "claude", capability: "evaluator", feature: "auth", task_id: null,
-      worktree_path: null, branch: null, tmux_session: null, pid: null, state: "working",
+      attempt: 1, runtime: "claude", capability: "evaluator", feature: "auth", task_id: null, execution_task_id: null,
+      worktree_path: null, transcript_path: null, branch: null, tmux_session: null, pid: null, state: "working",
       parent_agent: null, run_id: testRunId,
     });
     db.reviewScopes.create({

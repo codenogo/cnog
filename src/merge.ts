@@ -13,9 +13,16 @@
 import type { CnogDB } from "./db.js";
 import type { EventEmitter } from "./events.js";
 import type { Lifecycle } from "./lifecycle.js";
-import type { MergeQueueRow } from "./types.js";
+import type { ArtifactRow, ExecutionTaskRow, MergeQueueRow } from "./types.js";
 import { persistJsonArtifact } from "./artifacts.js";
+import { CnogError } from "./errors.js";
+import { RunController } from "./run-controller.js";
 import { _git } from "./worktree.js";
+import {
+  appendExecutionTaskOutput,
+  ensureExecutionTaskOutput,
+  resetExecutionTaskNotification,
+} from "./task-runtime.js";
 
 export interface MergeResult {
   success: boolean;
@@ -48,6 +55,11 @@ export class MergeQueue {
     headSha: string;
     filesModified?: string[];
   }): number {
+    const parentTaskId = this.resolveMergeParentTaskId({
+      runId: opts.runId,
+      sessionId: opts.sessionId,
+      issueId: opts.taskId ?? null,
+    });
     const id = this.db.merges.enqueue({
       feature: opts.feature,
       branch: opts.branch,
@@ -60,6 +72,10 @@ export class MergeQueue {
         ? JSON.stringify(opts.filesModified)
         : null,
     });
+    const entry = this.db.merges.listForRun(opts.runId).find((merge) => merge.id === id);
+    if (entry) {
+      this.ensureMergeExecutionTask(entry, parentTaskId);
+    }
     this.events.mergeEnqueued(opts.branch, opts.feature, opts.agentName);
     return id;
   }
@@ -79,21 +95,62 @@ export class MergeQueue {
   }
 
   private processEntry(entry: MergeQueueRow): MergeResult {
+    const executionTask = this.ensureMergeExecutionTask(entry);
+
     // Check lifecycle gating — uses run-based scope-hash matching
     if (this.lifecycle && entry.run_id) {
       const [allowed, reason] = this.lifecycle.canMerge(entry.run_id);
       if (!allowed) {
+        const blockedSummary = `Merge blocked: ${reason}`;
+        if (executionTask.status !== "pending" || executionTask.summary !== blockedSummary) {
+          resetExecutionTaskNotification(this.db, executionTask.id, this.projectRoot);
+          this.db.executionTasks.update(executionTask.id, {
+            status: "pending",
+            active_session_id: null,
+            summary: blockedSummary,
+            result_path: null,
+            last_error: null,
+          });
+          appendExecutionTaskOutput(
+            this.db,
+            executionTask.id,
+            `[blocked] ${reason}\n`,
+            this.projectRoot,
+          );
+        }
         return { success: false, tier: null, message: `Merge blocked: ${reason}`, conflicts: [] };
       }
     }
 
     this.db.merges.updateStatus(entry.id, "merging");
+    resetExecutionTaskNotification(this.db, executionTask.id, this.projectRoot);
+    this.db.executionTasks.update(executionTask.id, {
+      status: "running",
+      active_session_id: null,
+      summary: `Merging ${entry.branch} into ${this.canonicalBranch}`,
+      result_path: null,
+      last_error: null,
+    });
+    appendExecutionTaskOutput(
+      this.db,
+      executionTask.id,
+      `\n=== merge ${entry.branch} -> ${this.canonicalBranch} (${new Date().toISOString()}) ===\n`,
+      this.projectRoot,
+    );
 
     // Tier 1: Clean merge
     const tier1 = this.tryCleanMerge(entry.branch);
     if (tier1.success) {
       this.db.merges.updateStatus(entry.id, "merged", "clean");
-      this.recordMergeArtifact(entry, "merged", tier1, "clean");
+      const artifact = this.recordMergeArtifact(entry, "merged", tier1, "clean");
+      this.db.executionTasks.update(executionTask.id, {
+        status: "completed",
+        active_session_id: null,
+        summary: tier1.message,
+        result_path: artifact.path,
+        last_error: null,
+      });
+      appendExecutionTaskOutput(this.db, executionTask.id, `[merged] ${tier1.message}\n`, this.projectRoot);
       this.events.mergeCompleted(entry.branch, "clean");
       return tier1;
     }
@@ -102,7 +159,15 @@ export class MergeQueue {
     const tier2 = this.tryAutoResolve(entry.branch);
     if (tier2.success) {
       this.db.merges.updateStatus(entry.id, "merged", "auto");
-      this.recordMergeArtifact(entry, "merged", tier2, "auto");
+      const artifact = this.recordMergeArtifact(entry, "merged", tier2, "auto");
+      this.db.executionTasks.update(executionTask.id, {
+        status: "completed",
+        active_session_id: null,
+        summary: tier2.message,
+        result_path: artifact.path,
+        last_error: null,
+      });
+      appendExecutionTaskOutput(this.db, executionTask.id, `[merged] ${tier2.message}\n`, this.projectRoot);
       this.events.mergeCompleted(entry.branch, "auto");
       return tier2;
     }
@@ -110,12 +175,27 @@ export class MergeQueue {
     // Tier 3/4: Mark as conflict for orchestrator
     const conflicts = this.detectConflicts(entry.branch);
     this.db.merges.updateStatus(entry.id, "conflict");
-    this.recordMergeArtifact(entry, "conflict", {
+    const conflictArtifact = this.recordMergeArtifact(entry, "conflict", {
       success: false,
       tier: "conflict",
       message: `Merge conflicts in ${conflicts.length} file(s). Needs AI resolution or re-plan.`,
       conflicts,
     });
+    this.db.executionTasks.update(executionTask.id, {
+      status: "failed",
+      active_session_id: null,
+      summary: `Merge conflict in ${entry.branch}`,
+      result_path: conflictArtifact.path,
+      last_error: conflicts.length > 0
+        ? `Conflicts: ${conflicts.join(", ")}`
+        : `Merge conflict while integrating ${entry.branch}`,
+    });
+    appendExecutionTaskOutput(
+      this.db,
+      executionTask.id,
+      `[conflict] ${conflicts.length > 0 ? conflicts.join(", ") : entry.branch}\n`,
+      this.projectRoot,
+    );
     this.handleConflict(entry, conflicts);
     this.events.mergeConflict(entry.branch, conflicts);
 
@@ -125,6 +205,78 @@ export class MergeQueue {
       message: `Merge conflicts in ${conflicts.length} file(s). Needs AI resolution or re-plan.`,
       conflicts,
     };
+  }
+
+  private resolveMergeParentTaskId(opts: {
+    runId: string;
+    sessionId: string;
+    issueId: string | null;
+  }): string | null {
+    if (opts.issueId) {
+      const buildTask = this.db.executionTasks.getByLogicalName(
+        opts.runId,
+        this.buildIssueExecutionTaskLogicalName(opts.issueId),
+      );
+      if (!buildTask) {
+        throw new CnogError("MERGE_PARENT_MISSING", { issueId: opts.issueId });
+      }
+      return buildTask.id;
+    }
+
+    return this.db.sessions.getById(opts.sessionId)?.execution_task_id ?? null;
+  }
+
+  private ensureMergeExecutionTask(entry: MergeQueueRow, resolvedParentTaskId?: string | null): ExecutionTaskRow {
+    const logicalName = this.buildMergeExecutionTaskLogicalName(entry.id);
+    const parentTaskId = resolvedParentTaskId ?? this.resolveMergeParentTaskId({
+      runId: entry.run_id,
+      sessionId: entry.session_id,
+      issueId: entry.task_id,
+    });
+    const existing = this.db.executionTasks.getByLogicalName(entry.run_id, logicalName);
+    if (existing) {
+      ensureExecutionTaskOutput(this.db, existing.id, this.projectRoot);
+      if (existing.issue_id !== entry.task_id || existing.parent_task_id !== parentTaskId) {
+        this.db.executionTasks.update(existing.id, {
+          issue_id: entry.task_id ?? null,
+          parent_task_id: parentTaskId,
+          summary: existing.summary ?? `Pending merge for ${entry.branch}`,
+        });
+      }
+      return existing;
+    }
+
+    const taskId = `xtask-merge-${entry.id}`;
+    this.db.executionTasks.create({
+      id: taskId,
+      run_id: entry.run_id,
+      issue_id: entry.task_id ?? null,
+      review_scope_id: null,
+      parent_task_id: parentTaskId,
+      logical_name: logicalName,
+      kind: "merge",
+      capability: "system",
+      executor: "system",
+      status: "pending",
+      active_session_id: null,
+      summary: `Pending merge for ${entry.branch}`,
+      output_path: null,
+      result_path: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: null,
+    });
+    ensureExecutionTaskOutput(this.db, taskId, this.projectRoot);
+    return this.db.executionTasks.get(taskId)!;
+  }
+
+  private buildMergeExecutionTaskLogicalName(entryId: number): string {
+    return `merge:${entryId}`;
+  }
+
+  private buildIssueExecutionTaskLogicalName(issueId: string): string {
+    return `build:${issueId}`;
   }
 
   private ensureOnCanonical(): boolean {
@@ -171,30 +323,17 @@ export class MergeQueue {
   private handleConflict(entry: MergeQueueRow, conflicts: string[]): void {
     const run = this.db.runs.get(entry.run_id);
     if (!run || !this.lifecycle) return;
-
-    if (entry.task_id) {
-      this.db.issues.update(entry.task_id, { status: "open", assignee: null });
-      this.db.issues.logEvent({
-        issue_id: entry.task_id,
-        event_type: "merge_conflict",
-        actor: "merge",
-        data: JSON.stringify({ branch: entry.branch, conflicts }),
-      });
-    }
-
-    for (const scope of this.db.reviewScopes.listByRun(entry.run_id)) {
-      if (scope.scope_status === "approved" || scope.scope_status === "evaluating") {
-        this.db.reviewScopes.updateStatus(scope.id, "stale");
-      }
-    }
+    const controller = new RunController(this.db, this.events, this.projectRoot);
+    const { targetPhase } = controller.handleMergeConflict({
+      entry,
+      conflicts,
+    });
 
     try {
       if (run.status === "merge") {
-        const target = entry.task_id ? "build" : "failed";
-        this.lifecycle.advanceRun(entry.run_id, target, `Merge conflict on ${entry.branch}`);
+        this.lifecycle.advanceRun(entry.run_id, targetPhase, `Merge conflict on ${entry.branch}`);
       } else if (run.status === "evaluate") {
-        const target = entry.task_id ? "build" : "failed";
-        this.lifecycle.advanceRun(entry.run_id, target, `Merge conflict on ${entry.branch}`);
+        this.lifecycle.advanceRun(entry.run_id, targetPhase, `Merge conflict on ${entry.branch}`);
       }
     } catch {
       // Preserve conflict state even if the run was already moved elsewhere.
@@ -206,9 +345,9 @@ export class MergeQueue {
     status: "merged" | "conflict",
     result: MergeResult,
     resolvedTier?: string,
-  ): void {
+  ): ArtifactRow {
     const suffix = status === "merged" ? resolvedTier ?? "unknown" : "conflict";
-    persistJsonArtifact({
+    return persistJsonArtifact({
       db: this.db,
       artifactId: `art-merge-${entry.id}-${suffix}`,
       runId: entry.run_id,

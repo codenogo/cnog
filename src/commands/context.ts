@@ -6,7 +6,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
 import { CnogDB } from "../db.js";
 import { EventEmitter } from "../events.js";
@@ -20,7 +20,7 @@ import { Dispatcher } from "../dispatch.js";
 import { ExecutionEngine } from "../execution.js";
 import { ContractManager } from "../contracts.js";
 import { CnogError } from "../errors.js";
-import { loadConfig, type CnogConfig } from "../config.js";
+import { loadConfig, resolveConfigProjectRoot, type CnogConfig } from "../config.js";
 import { CNOG_DIR, DB_PATH, findProjectRoot } from "../paths.js";
 
 export interface CommandContext {
@@ -69,14 +69,12 @@ export function buildContext(db?: CnogDB): CommandContext {
   const database = db ?? openDb();
   const discoveredRoot = findProjectRoot();
   const config = loadConfig(discoveredRoot);
-  const root = config.project.root === "."
-    ? discoveredRoot
-    : resolve(discoveredRoot, config.project.root);
+  const root = resolveConfigProjectRoot(discoveredRoot, config);
   const events = new EventEmitter(database);
   const mail = new MailClient(database);
   const memory = new MemoryEngine(database);
   const lifecycle = new Lifecycle(database, events, root);
-  const agents = new AgentManager(database, events, root);
+  const agents = new AgentManager(database, events, root, "agents", config.worktree);
   const mergeQueue = new MergeQueue(
     database,
     events,
@@ -90,6 +88,8 @@ export function buildContext(db?: CnogDB): CommandContext {
     mail,
     config.watchdog.staleThresholdMs,
     config.watchdog.zombieThresholdMs,
+    undefined,
+    root,
   );
   const dispatcher = new Dispatcher(database, lifecycle, memory, events, root);
   const execution = new ExecutionEngine(
@@ -103,6 +103,7 @@ export function buildContext(db?: CnogDB): CommandContext {
     config.agents.runtime,
     config.project.canonicalBranch,
     root,
+    config.worktree,
   );
   const contracts = new ContractManager(database, events, root);
 

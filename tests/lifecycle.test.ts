@@ -126,6 +126,7 @@ function createTestSession(runId: string, feature: string, name?: string): strin
     feature,
     task_id: null,
     worktree_path: null,
+    transcript_path: null,
     branch: `cnog/${feature}/${sessionName}`,
     tmux_session: null,
     pid: null,
@@ -175,6 +176,7 @@ function setupApprovedScope(
     feature,
     task_id: null,
     worktree_path: null,
+    transcript_path: null,
     branch: null,
     tmux_session: null,
     pid: null,
@@ -558,6 +560,7 @@ describe("Lifecycle (run-authoritative)", () => {
       feature,
       task_id: null,
       worktree_path: null,
+      transcript_path: null,
       branch: null,
       tmux_session: null,
       pid: null,
@@ -616,6 +619,7 @@ describe("Lifecycle (run-authoritative)", () => {
       feature,
       task_id: null,
       worktree_path: null,
+      transcript_path: null,
       branch: null,
       tmux_session: null,
       pid: null,
@@ -720,6 +724,7 @@ describe("Lifecycle (run-authoritative)", () => {
       feature,
       task_id: null,
       worktree_path: null,
+      transcript_path: null,
       branch: null,
       tmux_session: null,
       pid: null,
@@ -923,6 +928,7 @@ describe("Lifecycle (run-authoritative)", () => {
       feature,
       task_id: null,
       worktree_path: null,
+      transcript_path: null,
       branch: null,
       tmux_session: null,
       pid: null,
@@ -977,5 +983,164 @@ describe("Lifecycle (run-authoritative)", () => {
     expect(removeWorktree).toHaveBeenCalledWith("builder-auth-reset", tmpDir, true);
     expect(deleteBranch).toHaveBeenCalledWith(feature, "builder-auth-reset", tmpDir, true);
     expect(db.sessions.get("builder-auth-reset")?.state).toBe("failed");
+  });
+
+  it("removes review-scope verifier worktrees during run reset", () => {
+    const feature = "auth";
+    const runId = createRun(feature);
+
+    const removeWorktree = vi.spyOn(worktree, "remove").mockReturnValue(true);
+    const deleteBranch = vi.spyOn(worktree, "deleteBranch").mockReturnValue(true);
+
+    db.reviewScopes.create({
+      id: "scope-reset-verify",
+      run_id: runId,
+      scope_status: "pending",
+      scope_hash: "scope-hash-reset-verify",
+      merge_entries: JSON.stringify([]),
+      branches: JSON.stringify(["cnog/auth/builder-auth"]),
+      head_shas: JSON.stringify(["abc123"]),
+      contract_ids: JSON.stringify([]),
+      contract_hashes: JSON.stringify([]),
+      verify_commands: JSON.stringify(["npm test"]),
+      verdict: null,
+      evaluator_session: null,
+    });
+    db.executionTasks.create({
+      id: "xtask-review-reset-parent",
+      run_id: runId,
+      issue_id: null,
+      review_scope_id: "scope-reset-verify",
+      parent_task_id: null,
+      logical_name: `implementation_review:${runId}`,
+      kind: "implementation_review",
+      capability: "evaluator",
+      executor: "agent",
+      status: "pending",
+      active_session_id: null,
+      summary: "Ready to evaluate implementation scope",
+      output_path: `.cnog/features/${feature}/runs/${runId}/tasks/xtask-review-reset-parent.output`,
+      result_path: null,
+      command: null,
+      cwd: null,
+      process_id: null,
+      exit_code: null,
+      output_size: 0,
+      last_output_at: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: null,
+    });
+    db.executionTasks.create({
+      id: "xtask-verify-reset-scope-00",
+      run_id: runId,
+      issue_id: null,
+      review_scope_id: "scope-reset-verify",
+      parent_task_id: "xtask-review-reset-parent",
+      logical_name: "verify:scope-reset-verify:00",
+      kind: "verify",
+      capability: "shell",
+      executor: "shell",
+      status: "running",
+      active_session_id: null,
+      summary: "Running verify command: npm test",
+      output_path: `.cnog/features/${feature}/runs/${runId}/tasks/xtask-verify-reset-scope-00.output`,
+      result_path: null,
+      command: "npm test",
+      cwd: join(tmpDir, ".cnog", "worktrees", "verify-scope-scope-reset-verify"),
+      process_id: null,
+      exit_code: null,
+      output_size: 0,
+      last_output_at: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: null,
+    });
+
+    lifecycle.resetRun(runId, "cleanup verifier");
+
+    expect(removeWorktree).toHaveBeenCalledWith("verify-scope-scope-reset-verify", tmpDir, true);
+    expect(deleteBranch).toHaveBeenCalledWith(feature, "verify-scope-scope-reset-verify", tmpDir, true);
+  });
+
+  it("supersedes non-terminal execution tasks during run reset", () => {
+    const feature = "auth";
+    const runId = createRun(feature);
+    advanceTo(runId, feature, "build");
+
+    db.issues.create({
+      id: "cn-reset-task",
+      title: "Reset me",
+      description: null,
+      issue_type: "task",
+      status: "open",
+      priority: 1,
+      assignee: null,
+      feature,
+      run_id: runId,
+      plan_number: null,
+      phase: "build",
+      parent_id: null,
+      metadata: null,
+    });
+    db.executionTasks.create({
+      id: "xtask-reset-build",
+      run_id: runId,
+      issue_id: "cn-reset-task",
+      review_scope_id: null,
+      parent_task_id: null,
+      logical_name: "build:cn-reset-task",
+      kind: "build",
+      capability: "builder",
+      executor: "agent",
+      status: "blocked",
+      active_session_id: null,
+      summary: "Blocked build",
+      output_path: `.cnog/features/${feature}/runs/${runId}/tasks/xtask-reset-build.output`,
+      result_path: null,
+      command: null,
+      cwd: null,
+      process_id: null,
+      exit_code: null,
+      output_size: 0,
+      last_output_at: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: "blocked",
+    });
+    db.executionTasks.create({
+      id: "xtask-reset-verify",
+      run_id: runId,
+      issue_id: "cn-reset-task",
+      review_scope_id: null,
+      parent_task_id: "xtask-reset-build",
+      logical_name: "verify:cn-reset-task:00",
+      kind: "verify",
+      capability: "shell",
+      executor: "shell",
+      status: "pending",
+      active_session_id: null,
+      summary: "Pending verify",
+      output_path: `.cnog/features/${feature}/runs/${runId}/tasks/xtask-reset-verify.output`,
+      result_path: null,
+      command: "npm test",
+      cwd: tmpDir,
+      process_id: null,
+      exit_code: null,
+      output_size: 0,
+      last_output_at: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: null,
+    });
+
+    lifecycle.resetRun(runId, "clear stale tasks");
+
+    expect(db.executionTasks.get("xtask-reset-build")?.status).toBe("superseded");
+    expect(db.executionTasks.get("xtask-reset-verify")?.status).toBe("superseded");
   });
 });

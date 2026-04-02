@@ -13,6 +13,7 @@ import type { AgentIdentity, AgentInfo } from "../src/agents.js";
 import type { Capability } from "../src/types.js";
 import { ContractManager } from "../src/contracts.js";
 import { MergeQueue } from "../src/merge.js";
+import { CnogError } from "../src/errors.js";
 
 describe("Dispatcher", () => {
   let tmpDir: string;
@@ -45,8 +46,28 @@ describe("Dispatcher", () => {
       spawn(opts: Record<string, unknown>): AgentInfo {
         spawnCalls.push(opts);
         const identity = opts.identity as AgentIdentity;
+        const sessionId = `session-${identity.name}`;
+        db.sessions.create({
+          id: sessionId,
+          name: identity.name,
+          logical_name: identity.logicalName,
+          attempt: identity.attempt,
+          runtime: String(opts.runtimeId),
+          capability: opts.capability as Capability,
+          feature: String(opts.feature),
+          task_id: (opts.taskId as string | undefined) ?? null,
+          execution_task_id: (opts.executionTaskId as string | undefined) ?? null,
+          worktree_path: "/tmp/worktree",
+          transcript_path: `.cnog/features/${String(opts.feature)}/runs/${String(opts.runId)}/sessions/${identity.name}.log`,
+          branch: `cnog/${String(opts.feature)}/${identity.name}`,
+          tmux_session: "cnog-test",
+          pid: 123,
+          state: "working",
+          parent_agent: null,
+          run_id: String(opts.runId),
+        });
         return {
-          id: "agent-id",
+          id: sessionId,
           name: identity.name,
           runtime: String(opts.runtimeId),
           capability: opts.capability as Capability,
@@ -54,6 +75,7 @@ describe("Dispatcher", () => {
           state: "working",
           branch: (opts.baseBranch as string | undefined) ?? null,
           worktreePath: "/tmp/worktree",
+          transcriptPath: `.cnog/features/${String(opts.feature)}/runs/${String(opts.runId)}/sessions/${identity.name}.log`,
           tmuxSession: "cnog-test",
           pid: 123,
           parentAgent: null,
@@ -135,28 +157,22 @@ describe("Dispatcher", () => {
 
     const firstSpawn = execution.spawnAccepted("auth", "migration-rollout");
     expect(firstSpawn.some((result) => result.status === "spawned")).toBe(true);
+    expect(db.executionTasks.list({ run_id: run!.id, issue_id: taskA!.id })[0]?.status).toBe("running");
 
     expect(spawnCalls).toHaveLength(1);
-    expect(spawnCalls[0].verifyCommands).toContain("npx tsc --noEmit");
+    const firstIdentity = spawnCalls[0].identity as AgentIdentity;
+    const firstAgentName = firstIdentity.name;
+    expect(spawnCalls[0].verifyCommands).toEqual([]);
+    expect((spawnCalls[0].assignmentSpec as { canonicalVerifyCommands: string[] }).canonicalVerifyCommands)
+      .toContain("npx tsc --noEmit");
 
-    memory.done(taskA!.id, "builder-auth");
-    db.sessions.create({
-      id: "session-a",
-      name: "builder-auth",
-      logical_name: "builder-auth",
-      attempt: 1,
-      runtime: "claude",
-      capability: "builder",
-      feature: "auth",
-      task_id: taskA!.id,
-      worktree_path: "/tmp/worktree-a",
-      branch: "cnog/auth/builder-auth",
-      tmux_session: null,
-      pid: null,
-      state: "completed",
-      parent_agent: null,
-      run_id: run!.id,
-    });
+    memory.done(taskA!.id, firstAgentName);
+    db.sessions.updateState(firstAgentName, "completed");
+    db.db.prepare("UPDATE sessions SET branch = ? WHERE name = ?").run(`cnog/auth/${firstAgentName}`, firstAgentName);
+    db.executionTasks.update(
+      db.executionTasks.list({ run_id: run!.id, issue_id: taskA!.id })[0]!.id,
+      { status: "completed", active_session_id: null, summary: "Completed" },
+    );
 
     spawnCalls = [];
     dispatcher.dispatchFeature("auth");
@@ -170,9 +186,12 @@ describe("Dispatcher", () => {
 
     expect(spawnCalls).toHaveLength(1);
     expect(spawnCalls[0].taskId).toBe(taskB!.id);
-    expect(spawnCalls[0].baseBranch).toBe("cnog/auth/builder-auth");
+    expect(db.executionTasks.list({ run_id: run!.id, issue_id: taskB!.id })[0]?.kind).toBe("build");
+    expect(spawnCalls[0].baseBranch).toBe(`cnog/auth/${firstAgentName}`);
     expect(spawnCalls[0].seedBranches).toEqual([]);
-    expect(spawnCalls[0].verifyCommands).toContain("npx tsc --noEmit");
+    expect(spawnCalls[0].verifyCommands).toEqual([]);
+    expect((spawnCalls[0].assignmentSpec as { canonicalVerifyCommands: string[] }).canonicalVerifyCommands)
+      .toContain("npx tsc --noEmit");
   });
 
   it("allocates a new concrete agent name when retrying a completed task", () => {
@@ -194,23 +213,12 @@ describe("Dispatcher", () => {
 
     const firstIdentity = spawnCalls[0].identity as AgentIdentity;
     const firstAgentName = firstIdentity.name;
-    db.sessions.create({
-      id: "session-retry-1",
-      name: firstAgentName,
-      logical_name: firstAgentName,
-      attempt: 1,
-      runtime: "claude",
-      capability: "builder",
-      feature: "auth",
-      task_id: taskA!.id,
-      worktree_path: "/tmp/worktree-a",
-      branch: "cnog/auth/retry-a",
-      tmux_session: null,
-      pid: null,
-      state: "completed",
-      parent_agent: null,
-      run_id: run!.id,
-    });
+    db.sessions.updateState(firstAgentName, "completed");
+    db.db.prepare("UPDATE sessions SET branch = ? WHERE name = ?").run("cnog/auth/retry-a", firstAgentName);
+    db.executionTasks.update(
+      db.executionTasks.list({ run_id: run!.id, issue_id: taskA!.id })[0]!.id,
+      { status: "completed", active_session_id: null, summary: "Completed" },
+    );
     db.issues.update(taskA!.id, { status: "open", assignee: null });
 
     spawnCalls = [];
@@ -223,6 +231,78 @@ describe("Dispatcher", () => {
     expect(retryIdentity.name).toBe(`${firstAgentName}-r2`);
   });
 
+  it("supersedes child verify and merge work when a build task is retried", () => {
+    dispatcher.dispatchFeature("auth", "migration-rollout");
+
+    const taskA = memory.list({ feature: "auth" }).find((issue) => issue.title === "Task A");
+    expect(taskA).toBeDefined();
+
+    const run = db.runs.latestForFeature("auth");
+    expect(run).toBeDefined();
+
+    const contracts = new ContractManager(db, events, tmpDir);
+    const taskAContract = contracts.loadLatestForIssue(taskA!.id, "auth");
+    contracts.accept(taskAContract!.id, "auth", "evaluator-auth");
+
+    execution.spawnAccepted("auth");
+    const firstIdentity = spawnCalls[0].identity as AgentIdentity;
+    const firstAgentName = firstIdentity.name;
+    const firstSession = db.sessions.get(firstAgentName)!;
+    const buildTask = db.executionTasks.list({ run_id: run!.id, issue_id: taskA!.id })[0]!;
+
+    db.sessions.updateState(firstAgentName, "completed");
+    db.db.prepare("UPDATE sessions SET branch = ? WHERE name = ?").run("cnog/auth/retry-a", firstAgentName);
+    db.executionTasks.update(buildTask.id, {
+      status: "completed",
+      active_session_id: null,
+      summary: "Completed",
+    });
+    db.executionTasks.create({
+      id: "xtask-verify-child",
+      run_id: run!.id,
+      issue_id: taskA!.id,
+      review_scope_id: null,
+      parent_task_id: buildTask.id,
+      logical_name: `verify:${taskA!.id}:00`,
+      kind: "verify",
+      capability: "shell",
+      executor: "shell",
+      status: "completed",
+      active_session_id: null,
+      summary: "Verify passed",
+      output_path: `.cnog/features/auth/runs/${run!.id}/tasks/xtask-verify-child.output`,
+      result_path: `.cnog/features/auth/runs/${run!.id}/verify-report.json`,
+      output_offset: 0,
+      notified: 1,
+      notified_at: "2026-04-01 10:00:00",
+      last_error: null,
+    });
+    const mergeQueue = new MergeQueue(db, events, "main", tmpDir, lifecycle);
+    const mergeEntryId = mergeQueue.enqueue({
+      feature: "auth",
+      branch: "cnog/auth/retry-a",
+      agentName: firstAgentName,
+      runId: run!.id,
+      sessionId: firstSession.id,
+      taskId: taskA!.id,
+      headSha: "abc123",
+      filesModified: ["src/a.ts"],
+    });
+    db.executionTasks.update(`xtask-merge-${mergeEntryId}`, {
+      parent_task_id: null,
+      summary: "Legacy orphaned merge task",
+    });
+
+    db.issues.update(taskA!.id, { status: "open", assignee: null });
+    spawnCalls = [];
+    execution.spawnAccepted("auth");
+
+    expect(spawnCalls).toHaveLength(1);
+    expect(db.executionTasks.get("xtask-verify-child")?.status).toBe("superseded");
+    expect(db.executionTasks.get(`xtask-merge-${mergeEntryId}`)?.status).toBe("superseded");
+    expect(db.merges.listForRun(run!.id).find((entry) => entry.id === mergeEntryId)?.status).toBe("failed");
+  });
+
   it("spawns an evaluator for pending contracts before builders start", () => {
     dispatcher.dispatchFeature("auth", "migration-rollout");
 
@@ -231,7 +311,9 @@ describe("Dispatcher", () => {
     expect(results.some((result) => result.status === "spawned")).toBe(true);
     expect(spawnCalls).toHaveLength(1);
     expect(spawnCalls[0].capability).toBe("evaluator");
-    expect(String(spawnCalls[0].completionCommand)).toContain('"kind":"contract_review"');
+    const run = db.runs.latestForFeature("auth")!;
+    expect(db.executionTasks.getByLogicalName(run.id, `contract_review:${run.id}`)?.status).toBe("running");
+    expect(String(spawnCalls[0].completionCommand)).toContain("cnog report contract-review");
   });
 
   it("creates a fresh issue DAG for each new run of the same feature", () => {
@@ -252,5 +334,236 @@ describe("Dispatcher", () => {
     const secondIssueIds = db.issues.list({ run_id: secondRun!.id }).map((issue) => issue.id);
     expect(secondIssueIds).toHaveLength(2);
     expect(secondIssueIds).not.toEqual(firstIssueIds);
+  });
+
+  it("fails the run when evaluator retries are exhausted", () => {
+    dispatcher.dispatchFeature("auth", "migration-rollout");
+    const run = db.runs.latestForFeature("auth");
+    expect(run).toBeDefined();
+
+    const failingExecution = new ExecutionEngine(
+      db,
+      {
+        allocateIdentity(logicalName: string): AgentIdentity {
+          throw new CnogError("AGENT_RETRY_EXHAUSTED", {
+            name: logicalName,
+            retries: "3",
+          });
+        },
+        spawn(): AgentInfo {
+          throw new Error("spawn should not be called");
+        },
+      } as never,
+      lifecycle,
+      memory,
+      new MergeQueue(db, events, "main", tmpDir, lifecycle),
+      events,
+      dispatcher,
+      "claude",
+      "main",
+      tmpDir,
+    );
+
+    failingExecution.continueRun(run!.id);
+
+    expect(db.runs.get(run!.id)?.status).toBe("failed");
+    expect(db.runs.get(run!.id)?.phase_reason).toContain("retry budget");
+  });
+
+  it("reopens failed builder work and retries from task state", () => {
+    dispatcher.dispatchFeature("auth", "migration-rollout");
+
+    const run = db.runs.latestForFeature("auth");
+    expect(run).toBeDefined();
+
+    const taskA = memory.list({ feature: "auth" }).find((issue) => issue.title === "Task A");
+    expect(taskA).toBeDefined();
+
+    const contracts = new ContractManager(db, events, tmpDir);
+    const taskAContract = contracts.loadLatestForIssue(taskA!.id, "auth");
+    expect(taskAContract).toBeDefined();
+    contracts.accept(taskAContract!.id, "auth", "evaluator-auth");
+
+    execution.spawnAccepted("auth");
+    expect(spawnCalls).toHaveLength(1);
+
+    const firstIdentity = spawnCalls[0].identity as AgentIdentity;
+    const firstAgentName = firstIdentity.name;
+
+    db.sessions.updateState(firstAgentName, "failed", "OOM");
+    execution.handleSessionFailure(firstAgentName, "OOM");
+
+    expect(db.executionTasks.list({ run_id: run!.id, issue_id: taskA!.id })[0]?.status).toBe("failed");
+    expect(memory.get(taskA!.id)?.status).toBe("open");
+    expect(memory.get(taskA!.id)?.assignee).toBeNull();
+
+    spawnCalls = [];
+    execution.continueRun(run!.id);
+
+    expect(spawnCalls).toHaveLength(1);
+    const retryIdentity = spawnCalls[0].identity as AgentIdentity;
+    expect(retryIdentity.name).toBe(`${firstAgentName}-r2`);
+    expect(db.executionTasks.list({ run_id: run!.id, issue_id: taskA!.id })[0]?.status).toBe("running");
+  });
+
+  it("blocks implementation evaluation when review-scope verification fails", () => {
+    const runId = `run-evaluate-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    db.runs.create({
+      id: runId,
+      feature: "auth",
+      plan_number: "01",
+      status: "evaluate",
+      phase_reason: null,
+      profile: "migration-rollout",
+      tasks: null,
+      review: null,
+      ship: null,
+      worktree_path: null,
+    });
+    const issue = memory.create({
+      title: "Task A",
+      feature: "auth",
+      runId,
+      planNumber: "01",
+      metadata: { planTaskKey: "auth:01:00", planTaskIndex: 0 },
+    });
+
+    const contracts = new ContractManager(db, events, tmpDir);
+    contracts.propose({
+      id: "contract-eval-a",
+      taskId: issue.id,
+      runId,
+      feature: "auth",
+      agentName: "builder-auth-a",
+      acceptanceCriteria: [{ description: "Do the thing", testable: true }],
+      verifyCommands: ["npm test"],
+      fileScope: ["src/a.ts"],
+      status: "proposed",
+      proposedAt: new Date().toISOString(),
+      reviewedBy: null,
+      reviewedAt: null,
+      reviewNotes: null,
+    });
+    contracts.accept("contract-eval-a", "auth", "evaluator-auth");
+
+    const builderSessionId = `session-builder-auth-done`;
+    db.sessions.create({
+      id: builderSessionId,
+      name: "builder-auth-done",
+      logical_name: "builder-auth-done",
+      attempt: 1,
+      runtime: "claude",
+      capability: "builder",
+      feature: "auth",
+      task_id: issue.id,
+      execution_task_id: null,
+      worktree_path: null,
+      transcript_path: null,
+      branch: "cnog/auth/builder-auth-done",
+      tmux_session: null,
+      pid: null,
+      state: "completed",
+      parent_agent: null,
+      run_id: runId,
+    });
+    db.merges.enqueue({
+      feature: "auth",
+      branch: "cnog/auth/builder-auth-done",
+      agent_name: "builder-auth-done",
+      run_id: runId,
+      session_id: builderSessionId,
+      task_id: issue.id,
+      head_sha: "abc123",
+      files_modified: null,
+    });
+
+    execution.continueRun(runId);
+
+    expect(spawnCalls.some((call) => call.capability === "evaluator")).toBe(false);
+    const scope = db.reviewScopes.activeForRun(runId);
+    expect(scope).toBeDefined();
+    expect(db.executionTasks.list({ run_id: runId, review_scope_id: scope!.id, kind: "verify" })[0]?.status).toBe("failed");
+  });
+
+  it("manual evaluation request also blocks on failed review-scope verification", () => {
+    const runId = `run-evaluate-manual-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    db.runs.create({
+      id: runId,
+      feature: "auth",
+      plan_number: "01",
+      status: "build",
+      phase_reason: null,
+      profile: "migration-rollout",
+      tasks: null,
+      review: null,
+      ship: null,
+      worktree_path: null,
+    });
+    const issue = memory.create({
+      title: "Task A",
+      feature: "auth",
+      runId,
+      planNumber: "01",
+      metadata: { planTaskKey: "auth:01:00", planTaskIndex: 0 },
+    });
+    db.issues.update(issue.id, { status: "done", assignee: null });
+
+    const contracts = new ContractManager(db, events, tmpDir);
+    contracts.propose({
+      id: "contract-eval-manual-a",
+      taskId: issue.id,
+      runId,
+      feature: "auth",
+      agentName: "builder-auth-a",
+      acceptanceCriteria: [{ description: "Do the thing", testable: true }],
+      verifyCommands: ["npm test"],
+      fileScope: ["src/a.ts"],
+      status: "proposed",
+      proposedAt: new Date().toISOString(),
+      reviewedBy: null,
+      reviewedAt: null,
+      reviewNotes: null,
+    });
+    contracts.accept("contract-eval-manual-a", "auth", "evaluator-auth");
+
+    const builderSessionId = "session-builder-auth-manual";
+    db.sessions.create({
+      id: builderSessionId,
+      name: "builder-auth-manual",
+      logical_name: "builder-auth-manual",
+      attempt: 1,
+      runtime: "claude",
+      capability: "builder",
+      feature: "auth",
+      task_id: issue.id,
+      execution_task_id: null,
+      worktree_path: null,
+      transcript_path: null,
+      branch: "cnog/auth/builder-auth-manual",
+      tmux_session: null,
+      pid: null,
+      state: "completed",
+      parent_agent: null,
+      run_id: runId,
+    });
+    db.merges.enqueue({
+      feature: "auth",
+      branch: "cnog/auth/builder-auth-manual",
+      agent_name: "builder-auth-manual",
+      run_id: runId,
+      session_id: builderSessionId,
+      task_id: issue.id,
+      head_sha: "abc124",
+      files_modified: null,
+    });
+
+    const result = execution.requestEvaluation("auth");
+
+    expect(result).toEqual({
+      status: "blocked",
+      reason: "Review-scope verification failed",
+    });
+    expect(spawnCalls.some((call) => call.capability === "evaluator")).toBe(false);
+    expect(db.runs.get(runId)?.status).toBe("evaluate");
   });
 });

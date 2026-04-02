@@ -28,6 +28,7 @@ export const WORKTREE_BASE = join(CNOG_DIR, "worktrees");
 export const CHECKPOINT_DIR = join(CNOG_DIR, "agents");
 export const CONTRACTS_DIR = join(CNOG_DIR, "contracts");
 export const REVIEWS_DIR = join(CNOG_DIR, "reviews");
+export const SCRATCH_DIR = join(CNOG_DIR, "scratch");
 export const PID_FILE = join(CNOG_DIR, "orchestrator.pid");
 export const LOG_FILE = join(CNOG_DIR, "orchestrator.log");
 
@@ -47,6 +48,67 @@ export function artifactPath(feature: string, runId: string, filename: string, p
 
 export function runArchiveDir(feature: string, runId: string, projectRoot: string = "."): string {
   return join(runArtifactDir(feature, runId, projectRoot), "archive");
+}
+
+export function runSessionDir(feature: string, runId: string, projectRoot: string = "."): string {
+  return join(runArtifactDir(feature, runId, projectRoot), "sessions");
+}
+
+export function runTaskDir(feature: string, runId: string, projectRoot: string = "."): string {
+  return join(runArtifactDir(feature, runId, projectRoot), "tasks");
+}
+
+export function runScratchDir(feature: string, runId: string, projectRoot: string = "."): string {
+  return resolve(projectRoot, SCRATCH_DIR, "runs", runId);
+}
+
+export function runScratchSharedDir(feature: string, runId: string, projectRoot: string = "."): string {
+  return join(runScratchDir(feature, runId, projectRoot), "shared");
+}
+
+export function runScratchRoleDir(
+  feature: string,
+  runId: string,
+  role: string,
+  projectRoot: string = ".",
+): string {
+  return join(runScratchDir(feature, runId, projectRoot), role);
+}
+
+export function runScratchAgentDir(
+  feature: string,
+  runId: string,
+  role: string,
+  agentName: string,
+  projectRoot: string = ".",
+): string {
+  return join(runScratchRoleDir(feature, runId, role, projectRoot), agentName);
+}
+
+export function sessionTranscriptRelativePath(feature: string, runId: string, agentName: string): string {
+  return join(FEATURES_ARTIFACT_DIR, feature, "runs", runId, "sessions", `${agentName}.log`);
+}
+
+export function sessionTranscriptPath(
+  feature: string,
+  runId: string,
+  agentName: string,
+  projectRoot: string = ".",
+): string {
+  return join(runSessionDir(feature, runId, projectRoot), `${agentName}.log`);
+}
+
+export function executionTaskOutputRelativePath(feature: string, runId: string, taskId: string): string {
+  return join(FEATURES_ARTIFACT_DIR, feature, "runs", runId, "tasks", `${taskId}.output`);
+}
+
+export function executionTaskOutputPath(
+  feature: string,
+  runId: string,
+  taskId: string,
+  projectRoot: string = ".",
+): string {
+  return join(runTaskDir(feature, runId, projectRoot), `${taskId}.output`);
 }
 
 // ---------------------------------------------------------------------------

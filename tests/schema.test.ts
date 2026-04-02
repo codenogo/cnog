@@ -31,9 +31,9 @@ function getColumns(tableName: string): string[] {
 describe("schema consistency", () => {
   it("sessions table has correct columns", () => {
     expect(getColumns("sessions")).toEqual([
-      "attempt", "branch", "capability", "completed_at", "error", "feature", "id",
-      "last_heartbeat", "logical_name", "name", "parent_agent", "pid", "run_id", "runtime",
-      "started_at", "state", "task_id", "tmux_session", "worktree_path",
+      "attempt", "branch", "capability", "completed_at", "error", "execution_task_id",
+      "feature", "id", "last_heartbeat", "logical_name", "name", "parent_agent", "pid",
+      "run_id", "runtime", "started_at", "state", "task_id", "tmux_session", "transcript_path", "worktree_path",
     ]);
   });
 
@@ -87,6 +87,15 @@ describe("schema consistency", () => {
     ]);
   });
 
+  it("session_progress table has correct columns", () => {
+    expect(getColumns("session_progress")).toEqual([
+      "cost_usd", "execution_task_id", "input_tokens", "last_activity_at",
+      "last_activity_kind", "last_activity_summary", "last_output_at", "last_tool_name",
+      "output_tokens", "recent_activities_json", "run_id", "session_id",
+      "tool_use_count", "transcript_path", "transcript_size", "updated_at",
+    ]);
+  });
+
   it("artifacts table has correct columns", () => {
     expect(getColumns("artifacts")).toEqual([
       "created_at", "feature", "hash", "id", "issue_id", "path",
@@ -111,6 +120,16 @@ describe("schema consistency", () => {
     ]);
   });
 
+  it("execution_tasks table has correct columns", () => {
+    expect(getColumns("execution_tasks")).toEqual([
+      "active_session_id", "capability", "command", "completed_at", "control_state_json", "created_at", "cwd",
+      "executor", "exit_code", "files_modified", "head_sha", "id", "issue_id", "kind", "last_error", "last_output_at",
+      "logical_name", "notified", "notified_at", "output_offset", "output_path", "output_size",
+      "parent_task_id", "process_id", "result_path", "review_scope_id", "run_id", "status",
+      "summary", "updated_at",
+    ]);
+  });
+
   it("all expected indexes exist", () => {
     const indexes = db.db
       .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'")
@@ -119,10 +138,14 @@ describe("schema consistency", () => {
 
     expect(names).toContain("idx_sessions_state");
     expect(names).toContain("idx_sessions_logical_attempt");
+    expect(names).toContain("idx_sessions_execution_task");
     expect(names).toContain("idx_messages_to_read");
     expect(names).toContain("idx_merge_queue_status");
     expect(names).toContain("idx_events_agent_ts");
     expect(names).toContain("idx_issues_feature");
+    expect(names).toContain("idx_execution_tasks_run_status");
+    expect(names).toContain("idx_execution_tasks_parent");
+    expect(names).toContain("idx_session_progress_run");
   });
 
   it("domain stores are accessible", () => {
@@ -131,9 +154,11 @@ describe("schema consistency", () => {
     expect(db.merges).toBeDefined();
     expect(db.runs).toBeDefined();
     expect(db.metrics).toBeDefined();
+    expect(db.sessionProgress).toBeDefined();
     expect(db.events).toBeDefined();
     expect(db.phases).toBeDefined();
     expect(db.issues).toBeDefined();
+    expect(db.executionTasks).toBeDefined();
   });
 
   it("domain stores work directly", () => {
@@ -151,7 +176,9 @@ describe("schema consistency", () => {
       capability: "builder",
       feature: null,
       task_id: null,
+      execution_task_id: null,
       worktree_path: null,
+      transcript_path: null,
       branch: null,
       tmux_session: null,
       pid: null,

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -48,6 +48,7 @@ describe("Watchdog", () => {
       feature: "auth",
       task_id: null,
       worktree_path: null,
+      transcript_path: null,
       branch: null,
       tmux_session: "cnog-builder-auth",
       pid: 123,
@@ -88,6 +89,7 @@ describe("Watchdog", () => {
       feature: "auth",
       task_id: null,
       worktree_path: null,
+      transcript_path: null,
       branch: null,
       tmux_session: "cnog-builder-recovered",
       pid: 123,
@@ -117,5 +119,113 @@ describe("Watchdog", () => {
     expect(db.sessions.get("builder-recovered")?.state).toBe("working");
     const recovery = db.events.query({ source: "watchdog" }).find((event) => event.event_type === "agent_recovered");
     expect(recovery).toBeDefined();
+  });
+
+  it("treats transcript growth as activity even when heartbeats are stale", () => {
+    const transcriptPath = `.cnog/features/auth/runs/${testRunId}/sessions/builder-output.log`;
+    const absoluteTranscriptPath = join(tmpDir, transcriptPath);
+    mkdirSync(join(tmpDir, ".cnog", "features", "auth", "runs", testRunId, "sessions"), { recursive: true });
+    writeFileSync(absoluteTranscriptPath, "working...\nmore output\n", "utf-8");
+
+    db.sessions.create({
+      id: "s3",
+      name: "builder-output",
+      logical_name: "builder-output",
+      attempt: 1,
+      runtime: "claude",
+      capability: "builder",
+      feature: "auth",
+      task_id: null,
+      execution_task_id: null,
+      worktree_path: null,
+      transcript_path: transcriptPath,
+      branch: null,
+      tmux_session: "cnog-builder-output",
+      pid: 123,
+      state: "working",
+      parent_agent: null,
+      run_id: testRunId,
+    });
+    db.db.prepare("UPDATE sessions SET started_at = ?, last_heartbeat = ? WHERE name = ?")
+      .run("2026-03-26 12:00:00", "2026-03-26 12:00:30", "builder-output");
+
+    const watchdog = new Watchdog(
+      db,
+      events,
+      mail,
+      60_000,
+      300_000,
+      {
+        isPidAlive: () => true,
+        isSessionAlive: () => true,
+        nowMs: () => new Date("2026-03-26T12:02:00.000Z").getTime(),
+      },
+      tmpDir,
+    );
+
+    watchdog.tick();
+
+    expect(db.sessions.get("builder-output")?.state).toBe("working");
+    expect(db.sessions.get("builder-output")?.last_heartbeat).toBeTruthy();
+    expect(db.sessionProgress.get("s3")).toMatchObject({
+      transcript_path: transcriptPath,
+      transcript_size: expect.any(Number),
+    });
+  });
+
+  it("detects prompt-like transcript tails and avoids zombie-killing the session", () => {
+    const transcriptPath = `.cnog/features/auth/runs/${testRunId}/sessions/builder-prompt.log`;
+    const absoluteTranscriptPath = join(tmpDir, transcriptPath);
+    mkdirSync(join(tmpDir, ".cnog", "features", "auth", "runs", testRunId, "sessions"), { recursive: true });
+    writeFileSync(absoluteTranscriptPath, "Install dependency now? (y/n)\n", "utf-8");
+
+    db.sessions.create({
+      id: "s4",
+      name: "builder-prompt",
+      logical_name: "builder-prompt",
+      attempt: 1,
+      runtime: "claude",
+      capability: "builder",
+      feature: "auth",
+      task_id: null,
+      execution_task_id: null,
+      worktree_path: null,
+      transcript_path: transcriptPath,
+      branch: null,
+      tmux_session: "cnog-builder-prompt",
+      pid: 123,
+      state: "working",
+      parent_agent: null,
+      run_id: testRunId,
+    });
+    db.sessionProgress.update("s4", {
+      run_id: testRunId,
+      transcript_path: transcriptPath,
+      transcript_size: Buffer.byteLength("Install dependency now? (y/n)\n"),
+    });
+    db.db.prepare("UPDATE sessions SET started_at = ?, last_heartbeat = ? WHERE name = ?")
+      .run("2026-03-26 12:00:00", "2026-03-26 12:00:10", "builder-prompt");
+
+    const watchdog = new Watchdog(
+      db,
+      events,
+      mail,
+      60_000,
+      300_000,
+      {
+        isPidAlive: () => true,
+        isSessionAlive: () => true,
+        nowMs: () => new Date("2026-03-26T12:10:00.000Z").getTime(),
+      },
+      tmpDir,
+    );
+
+    watchdog.tick();
+
+    expect(db.sessions.get("builder-prompt")?.state).toBe("stalled");
+    expect(db.sessions.get("builder-prompt")?.error).toBe("waiting for interactive input");
+    const waiting = db.events.query({ source: "watchdog" }).find((event) => event.event_type === "agent_waiting_input");
+    expect(waiting).toBeDefined();
+    expect(db.sessions.get("builder-prompt")?.completed_at).toBeNull();
   });
 });

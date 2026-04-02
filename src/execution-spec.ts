@@ -3,6 +3,8 @@ import { dirname, join, relative, resolve } from "node:path";
 
 import type { Issue } from "./memory.js";
 import type { Plan, PlanTask } from "./planning/plan-factory.js";
+import type { BuilderAssignmentSpec } from "./prompt-contract.js";
+import { buildLaunchPrompt, createBuilderAssignmentSpec } from "./prompt-contract.js";
 import {
   getVerifyCommands,
   requiresPackageChecks,
@@ -12,6 +14,7 @@ export interface ExecutionSpec {
   planTaskKey: string;
   taskIndex: number;
   task: PlanTask;
+  assignment: BuilderAssignmentSpec;
   fileScope: string[];
   packageVerifyCommands: string[];
   verifyCommands: string[];
@@ -149,61 +152,6 @@ export function derivePackageVerifyCommands(
   }
 }
 
-function buildTaskPrompt(
-  task: PlanTask,
-  plan: Plan,
-  verifyCommands: string[],
-): string {
-  const lines: string[] = [];
-
-  lines.push(`Implement: ${task.name}`);
-  lines.push("");
-  lines.push(task.action);
-
-  if (task.microSteps && task.microSteps.length > 0) {
-    lines.push("");
-    lines.push("## Steps");
-    task.microSteps.forEach((step, i) => {
-      lines.push(`${i + 1}. ${step}`);
-    });
-  }
-
-  if (task.contextLinks && task.contextLinks.length > 0) {
-    lines.push("");
-    lines.push("## Context");
-    task.contextLinks.forEach((link) => {
-      lines.push(`- ${link}`);
-    });
-  }
-
-  if (task.tdd?.required) {
-    lines.push("");
-    lines.push("## TDD");
-    if (task.tdd.failingVerify) {
-      lines.push(`- Failing test first: \`${task.tdd.failingVerify}\``);
-    }
-    if (task.tdd.passingVerify) {
-      lines.push(`- Then make it pass: \`${task.tdd.passingVerify}\``);
-    }
-  }
-
-  lines.push("");
-  lines.push("## Verify Commands");
-  verifyCommands.forEach((command) => {
-    lines.push(`- \`${command}\``);
-  });
-
-  if (plan.planVerify.length > 0) {
-    lines.push("");
-    lines.push("## Plan Verify");
-    plan.planVerify.forEach((command) => {
-      lines.push(`- \`${command}\``);
-    });
-  }
-
-  return lines.join("\n");
-}
-
 export function buildExecutionSpec(opts: {
   plan: Plan;
   task: PlanTask;
@@ -223,14 +171,28 @@ export function buildExecutionSpec(opts: {
     ...packageVerifyCommands,
     ...profileVerifyCommands,
   ]);
-
-  return {
+  const assignment: BuilderAssignmentSpec = createBuilderAssignmentSpec({
+    objective: `Implement ${opts.task.name} for feature ${opts.plan.feature}`,
     planTaskKey: planTaskKeyFor(opts.plan, opts.taskIndex),
     taskIndex: opts.taskIndex,
+    taskName: opts.task.name,
+    action: opts.task.action,
+    planGoal: opts.plan.goal,
+    fileScope: opts.task.files,
+    microSteps: opts.task.microSteps,
+    contextLinks: opts.task.contextLinks,
+    canonicalVerifyCommands: verifyCommands,
+    packageVerifyCommands,
+  });
+
+  return {
+    planTaskKey: assignment.planTaskKey,
+    taskIndex: opts.taskIndex,
     task: opts.task,
+    assignment,
     fileScope: [...opts.task.files],
     packageVerifyCommands,
     verifyCommands,
-    taskPrompt: buildTaskPrompt(opts.task, opts.plan, verifyCommands),
+    taskPrompt: buildLaunchPrompt(assignment),
   };
 }

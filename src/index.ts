@@ -1,4 +1,4 @@
 #!/usr/bin/env node
-import { main } from "./cli.js";
+const { main } = await import("./cli.js");
 
-main(process.argv.slice(2));
+await main(process.argv.slice(2));

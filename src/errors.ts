@@ -29,6 +29,10 @@ export const ERROR_CATALOG: Record<string, { message: string; fix: string }> = {
     message: "Agent {name} already exists with state {state}",
     fix: "Stop it first: cnog stop-agent {name}",
   },
+  AGENT_RETRY_EXHAUSTED: {
+    message: "Agent {name} exceeded its retry budget ({retries} retries)",
+    fix: "Inspect failures: cnog agents --state failed",
+  },
   AGENT_NOT_FOUND: {
     message: "Agent {name} not found",
     fix: "List agents: cnog agents",
@@ -68,6 +72,10 @@ export const ERROR_CATALOG: Record<string, { message: string; fix: string }> = {
   MERGE_SCOPE_INVALID: {
     message: "Merge blocked: no approved review scope for run {runId}",
     fix: "Run evaluation first: cnog evaluate {feature}",
+  },
+  MERGE_PARENT_MISSING: {
+    message: "Merge for issue {issueId} is missing its build execution task",
+    fix: "Retry or redispatch the issue so cnog can recreate the canonical build task before merge",
   },
   MERGE_CONFLICT: {
     message: "Merge conflict on branch {branch}",

@@ -1,5 +1,3 @@
-import { spawnSync } from "node:child_process";
-
 import chalk from "chalk";
 
 import { persistJsonArtifact } from "../artifacts.js";
@@ -7,6 +5,7 @@ import { RunPhaseSchema } from "../types.js";
 import type { RunRow } from "../types.js";
 import { Lifecycle } from "../lifecycle.js";
 import { EventEmitter } from "../events.js";
+import { requestCanonicalVerification } from "../verify.js";
 import { withDb, buildContext } from "./context.js";
 
 export function phaseGetCommand(feature: string): void {
@@ -140,42 +139,40 @@ export function shipCommand(feature: string): void {
     }
 
     const verifyCommands = JSON.parse(approvedScope.verify_commands) as string[];
-    const commandResults = verifyCommands.map((command) => {
-      const result = spawnSync(command, {
-        cwd: ctx.projectRoot,
-        shell: true,
-        encoding: "utf-8",
-      });
-      return {
-        command,
-        passed: result.status === 0,
-        exitCode: result.status ?? 1,
-        stdout: result.stdout ?? "",
-        stderr: result.stderr ?? "",
-      };
-    });
-    const verificationPassed = commandResults.every((result) => result.passed);
-
-    const verifyArtifact = persistJsonArtifact({
+    let verification = requestCanonicalVerification({
       db,
-      artifactId: `art-verify-${approvedScope.id}-${Date.now()}`,
       runId: run.id,
       feature,
-      type: "verify-report",
-      filename: `verify-report-${approvedScope.id}-${Date.now()}.json`,
-      data: {
-        runId: run.id,
-        feature,
-        scopeId: approvedScope.id,
-        scopeHash: approvedScope.scope_hash,
-        canonicalBranch: ctx.config.project.canonicalBranch,
-        passed: verificationPassed,
-        results: commandResults,
-        verifiedAt: new Date().toISOString(),
-      },
+      scopeId: approvedScope.id,
+      scopeHash: approvedScope.scope_hash,
+      canonicalBranch: ctx.config.project.canonicalBranch,
+      commands: verifyCommands,
       projectRoot: ctx.projectRoot,
-      reviewScopeId: approvedScope.id,
     });
+    ctx.execution.reconcileRuns();
+    verification = requestCanonicalVerification({
+      db,
+      runId: run.id,
+      feature,
+      scopeId: approvedScope.id,
+      scopeHash: approvedScope.scope_hash,
+      canonicalBranch: ctx.config.project.canonicalBranch,
+      commands: verifyCommands,
+      projectRoot: ctx.projectRoot,
+    });
+
+    if (verification.status === "scheduled" || verification.status === "running") {
+      console.log(chalk.yellow(`Canonical verification started for ${feature}.`));
+      console.log(chalk.gray("  Re-run `cnog ship <feature>` once verification completes."));
+      return;
+    }
+
+    if (verification.status === "failed" || verification.status === "blocked" || !verification.artifact) {
+      console.log(chalk.red(`Cannot ship: canonical verification ${verification.status}`));
+      return;
+    }
+
+    const verifyArtifact = verification.artifact;
 
     const [canShip, reason] = lifecycle.canShip(run.id);
     if (!canShip) {

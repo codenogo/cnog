@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 
 import { CnogDB } from "../src/db.js";
-import { mailSendCommand } from "../src/commands/mail.js";
+import { reportBuilderCompleteCommand } from "../src/commands/mail.js";
 import { CNOG_DIR, DB_PATH } from "../src/paths.js";
 
 function git(cwd: string, ...args: string[]): void {
@@ -19,7 +19,7 @@ function git(cwd: string, ...args: string[]): void {
   }
 }
 
-describe.sequential("mailSendCommand", () => {
+describe.sequential("reportBuilderCompleteCommand", () => {
   let tmpDir: string;
   let originalCwd: string;
   let db: CnogDB;
@@ -44,6 +44,41 @@ describe.sequential("mailSendCommand", () => {
       id: runId, feature: "auth", plan_number: null, status: "plan", phase_reason: null,
       profile: null, tasks: null, review: null, ship: null, worktree_path: null,
     });
+    db.issues.create({
+      id: "cn-123",
+      title: "Implement auth task",
+      description: null,
+      issue_type: "task",
+      status: "open",
+      priority: 1,
+      assignee: null,
+      feature: "auth",
+      run_id: runId,
+      plan_number: null,
+      phase: null,
+      parent_id: null,
+      metadata: null,
+    });
+    db.executionTasks.create({
+      id: "xtask-auth-1",
+      run_id: runId,
+      issue_id: "cn-123",
+      review_scope_id: null,
+      parent_task_id: null,
+      logical_name: "build:cn-123",
+      kind: "build",
+      capability: "builder",
+      executor: "agent",
+      status: "running",
+      active_session_id: null,
+      summary: "Running build",
+      output_path: ".cnog/features/auth/runs/run-mail-cmd-1/tasks/xtask-auth-1.output",
+      result_path: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: null,
+    });
     db.sessions.create({
       id: "session-1",
       name: "builder-auth",
@@ -53,7 +88,9 @@ describe.sequential("mailSendCommand", () => {
       capability: "builder",
       feature: "auth",
       task_id: "cn-123",
+      execution_task_id: "xtask-auth-1",
       worktree_path: tmpDir,
+      transcript_path: null,
       branch: "cnog/auth/builder-auth",
       tmux_session: null,
       pid: null,
@@ -61,6 +98,7 @@ describe.sequential("mailSendCommand", () => {
       parent_agent: null,
       run_id: runId,
     });
+    db.executionTasks.update("xtask-auth-1", { active_session_id: "session-1" });
 
     process.chdir(tmpDir);
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -73,19 +111,42 @@ describe.sequential("mailSendCommand", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("infers the current agent and merge payload from the worktree branch", () => {
-    mailSendCommand("orchestrator", "done", {
-      body: "",
-      type: "worker_done",
-      priority: "high",
+  it("infers the current agent from the worktree branch and enriches the notification envelope", () => {
+    reportBuilderCompleteCommand({
+      summary: "Implemented auth task",
     });
 
     const messages = db.messages.checkMail("orchestrator");
     expect(messages).toHaveLength(1);
     expect(messages[0].from_agent).toBe("builder-auth");
-    expect(JSON.parse(messages[0].payload ?? "{}")).toMatchObject({
-      feature: "auth",
-      branch: "cnog/auth/builder-auth",
+    const payload = JSON.parse(messages[0].payload ?? "{}");
+    expect(messages[0].type).toBe("worker_notification");
+    expect(payload).toMatchObject({
+      protocolVersion: 2,
+      kind: "worker_notification",
+      status: "completed",
+      summary: "Implemented auth task",
+      run: {
+        id: "run-mail-cmd-1",
+        feature: "auth",
+      },
+      actor: {
+        agentName: "builder-auth",
+        logicalName: "builder-auth",
+        capability: "builder",
+      },
+      task: {
+        executionTaskId: "xtask-auth-1",
+        issueId: "cn-123",
+      },
+      worktree: {
+        branch: "cnog/auth/builder-auth",
+      },
+      data: {
+        kind: "builder_completion",
+      },
     });
+    expect(payload.usage.durationMs).toBeTypeOf("number");
+    expect(payload.worktree.headSha).toBeTruthy();
   });
 });

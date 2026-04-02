@@ -16,6 +16,18 @@ let tmpDir: string;
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "cnog-mail-full-"));
   db = new CnogDB(join(tmpDir, "test.db"));
+  db.runs.create({
+    id: "run-auth-1",
+    feature: "auth",
+    plan_number: null,
+    status: "build",
+    phase_reason: null,
+    profile: null,
+    tasks: null,
+    review: null,
+    ship: null,
+    worktree_path: null,
+  });
   mail = new MailClient(db);
 });
 
@@ -45,15 +57,47 @@ describe("MailClient — missing methods", () => {
     expect(mail.check("c")).toHaveLength(1);
   });
 
-  it("notifyMergeReady sends high-priority merge_ready", () => {
-    mail.notifyMergeReady("builder-1", "auth", "cnog/auth/builder-1");
+  it("notifyWorkerNotification sends high-priority worker_notification", () => {
+    mail.notifyWorkerNotification("builder-1", {
+      protocolVersion: 2,
+      kind: "worker_notification",
+      status: "completed",
+      summary: "Merged build work",
+      run: { id: "run-auth-1", feature: "auth" },
+      actor: {
+        agentName: "builder-1",
+        logicalName: "builder-1",
+        attempt: 1,
+        capability: "builder",
+        runtime: "claude",
+        sessionId: "session-builder-1",
+      },
+      task: {
+        executionTaskId: "xtask-auth-1",
+        kind: "build",
+        executor: "agent",
+        issueId: "cn-auth-1",
+      },
+      output: {
+        taskLogPath: ".cnog/features/auth/runs/run-auth-1/tasks/xtask-auth-1.output",
+      },
+      worktree: {
+        branch: "cnog/auth/builder-1",
+        headSha: "abc123",
+      },
+      data: {
+        kind: "builder_completion",
+        headSha: "abc123",
+        filesModified: ["src/auth.ts"],
+      },
+    });
 
     const msgs = mail.check("orchestrator");
     expect(msgs).toHaveLength(1);
-    expect(msgs[0].type).toBe("merge_ready");
+    expect(msgs[0].type).toBe("worker_notification");
     expect(msgs[0].priority).toBe("high");
     expect(msgs[0].payload).toBeDefined();
-    expect(msgs[0].payload!.branch).toBe("cnog/auth/builder-1");
-    expect(msgs[0].payload!.feature).toBe("auth");
+    expect((msgs[0].payload as { worktree?: { branch?: string } }).worktree?.branch).toBe("cnog/auth/builder-1");
+    expect((msgs[0].payload as { run?: { feature?: string } }).run?.feature).toBe("auth");
   });
 });

@@ -13,6 +13,7 @@ import type {
   SessionCheckpoint,
   SessionHandoff,
   HandoffReason,
+  SessionCheckpointResumeContext,
 } from "./types.js";
 import { persistJsonArtifact, loadArtifactJson } from "./artifacts.js";
 import { findProjectRoot } from "./paths.js";
@@ -58,6 +59,7 @@ function checkpointArtifactId(
 
 function renderProgressMarkdown(checkpoint: SessionCheckpoint): string {
   const lines: string[] = [];
+  const resume = checkpoint.resumeContext;
 
   lines.push(`# Progress: ${checkpoint.logicalName}`);
   lines.push("");
@@ -96,13 +98,54 @@ function renderProgressMarkdown(checkpoint: SessionCheckpoint): string {
     lines.push("");
   }
 
+  lines.push("## Resume context");
+  lines.push(`- Transcript: ${resume.transcriptPath ?? "-"}`);
+  lines.push(`- Task log: ${resume.taskLogPath ?? "-"}`);
+  lines.push(`- Last activity: ${resume.lastActivitySummary ?? "-"}`);
+  lines.push(`- Last activity at: ${resume.lastActivityAt ?? "-"}`);
+  lines.push(`- Tool uses: ${resume.toolUseCount}`);
+  lines.push(`- Duration: ${resume.durationMs ?? 0}ms`);
+  lines.push(`- Tokens: in=${resume.inputTokens} out=${resume.outputTokens}`);
+  lines.push(`- Cost: $${resume.costUsd.toFixed(4)}`);
+  if (resume.scratchpad.shared || resume.scratchpad.role || resume.scratchpad.agent) {
+    lines.push("");
+    lines.push("## Scratchpad");
+    if (resume.scratchpad.shared) lines.push(`- Shared: \`${resume.scratchpad.shared}\``);
+    if (resume.scratchpad.role) lines.push(`- Role: \`${resume.scratchpad.role}\``);
+    if (resume.scratchpad.agent) lines.push(`- Agent: \`${resume.scratchpad.agent}\``);
+  }
+  if (resume.recentActivities.length > 0) {
+    lines.push("");
+    lines.push("## Recent activities");
+    for (const activity of resume.recentActivities.slice(-5)) {
+      lines.push(`- ${activity.at} [${activity.kind}] ${activity.summary}`);
+    }
+  }
+  if (resume.transcriptTail) {
+    lines.push("");
+    lines.push("## Transcript tail");
+    lines.push("```text");
+    lines.push(resume.transcriptTail);
+    lines.push("```");
+  }
+  if (resume.taskLogTail) {
+    lines.push("");
+    lines.push("## Task log tail");
+    lines.push("```text");
+    lines.push(resume.taskLogTail);
+    lines.push("```");
+  }
+
   return lines.join("\n");
 }
 
 function isCheckpointPayload(value: unknown): value is StoredCheckpointArtifact {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<StoredCheckpointArtifact>;
-  return candidate.kind === "checkpoint" && !!candidate.checkpoint && typeof candidate.state === "string";
+  return candidate.kind === "checkpoint"
+    && !!candidate.checkpoint
+    && typeof candidate.state === "string"
+    && !!candidate.checkpoint.resumeContext;
 }
 
 function listCheckpointArtifacts(
@@ -327,4 +370,8 @@ export function loadProgressArtifact(
 ): string | null {
   const checkpoint = loadCheckpoint(db, selector, projectRoot);
   return checkpoint ? renderProgressMarkdown(checkpoint) : null;
+}
+
+export function extractResumeContext(checkpoint: SessionCheckpoint): SessionCheckpointResumeContext {
+  return checkpoint.resumeContext;
 }

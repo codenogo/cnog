@@ -10,24 +10,37 @@ import type { CnogDB } from "./db.js";
 import type { EventEmitter } from "./events.js";
 import type { ArtifactRow } from "./types.js";
 import type { Lifecycle } from "./lifecycle.js";
-import { persistJsonArtifact } from "./artifacts.js";
+import { loadArtifactJson, persistJsonArtifact } from "./artifacts.js";
 import { evaluateGrades, getRubric, renderGradingReport } from "./grading.js";
-import type { GradingRubric, SprintContract } from "./types.js";
+import type {
+  ContractReviewData,
+  GradingRubric,
+  ImplementationReviewData,
+  SprintContract,
+} from "./types.js";
 import { loadLatestPlan } from "./planning/plan-factory.js";
 import { ContractManager, loadContractFromArtifact } from "./contracts.js";
+import { RunController } from "./run-controller.js";
+import type { VerifyReportArtifact } from "./verify.js";
+import type {
+  ContractReviewAssignmentSpec,
+  ImplementationReviewAssignmentSpec,
+} from "./prompt-contract.js";
+import {
+  buildContractReviewResultCommand,
+  buildImplementationReviewResultCommand,
+  buildLaunchPrompt,
+  createContractReviewAssignmentSpec,
+  createImplementationReviewAssignmentSpec,
+} from "./prompt-contract.js";
 
 export interface EvaluationSpec {
+  assignment: ContractReviewAssignmentSpec | ImplementationReviewAssignmentSpec;
   taskPrompt: string;
   verifyCommands: string[];
   rubric?: GradingRubric;
   reviewKind: "contract" | "implementation";
   contractIds?: string[];
-}
-
-interface EvaluationMessageLike {
-  subject: string;
-  body?: string | null;
-  payload?: Record<string, unknown> | null;
 }
 
 interface ScopedContract {
@@ -48,12 +61,6 @@ interface ScopeSnapshot {
 interface PendingContractSnapshot {
   artifact: ArtifactRow;
   contract: SprintContract;
-}
-
-interface ContractReviewDecision {
-  contractId: string;
-  decision: string;
-  notes?: string;
 }
 
 /**
@@ -267,49 +274,39 @@ export function buildRunEvaluationSpec(opts: {
   const contractArtifacts = contractArtifactIds
     .map((id) => opts.db.artifacts.get(id))
     .filter((artifact): artifact is ArtifactRow => !!artifact);
+  const verifyArtifacts = opts.db.artifacts
+    .listByRun(run.id, "verify-report")
+    .filter((artifact) => artifact.review_scope_id === scope.id);
+  const latestScopeVerify = [...verifyArtifacts].reverse().find((artifact) => {
+    const report = loadArtifactJson<VerifyReportArtifact>(artifact, projectRoot);
+    return report?.mode === "review_scope" && report.scopeHash === scope.scope_hash;
+  });
 
-  const lines: string[] = [];
-  lines.push(`Evaluate the exact candidate scope for feature ${run.feature}.`);
-  lines.push("");
-  lines.push(`Run: ${run.id}`);
-  lines.push(`Scope: ${scope.id}`);
-  lines.push(`Scope Hash: ${scope.scope_hash}`);
-
-  if (plan?.goal) {
-    lines.push("");
-    lines.push(`Feature goal: ${plan.goal}`);
-  }
-
-  if (branches.length > 0) {
-    lines.push("");
-    lines.push(`Compare these pending branches against ${opts.canonicalBranch}:`);
-    for (const branch of branches) {
-      lines.push(`- ${branch}`);
-    }
-    lines.push("");
-    lines.push(
-      `Use \`git diff ${opts.canonicalBranch}...<branch>\` and inspect the branch contents before grading.`,
-    );
-  }
-
-  if (contractArtifacts.length > 0) {
-    lines.push("");
-    lines.push("Consult these accepted contract artifacts while evaluating:");
-    for (const artifact of contractArtifacts) {
-      lines.push(`- ${artifact.path} (${artifact.hash})`);
-    }
-  }
-
-  lines.push("");
-  lines.push("This verdict applies only to the scope hash above.");
-  lines.push("Run every verify command listed in the overlay.");
-  lines.push("Return APPROVE, REQUEST_CHANGES, or BLOCK.");
-  lines.push("Include structured scores in the result payload.");
+  const assignment: ImplementationReviewAssignmentSpec = createImplementationReviewAssignmentSpec({
+    objective: `Evaluate the exact candidate scope for feature ${run.feature}`,
+    runId: run.id,
+    feature: run.feature,
+    scopeId: scope.id,
+    scopeHash: scope.scope_hash,
+    branches,
+    contractArtifacts: contractArtifacts.map((artifact) => ({
+      id: artifact.id,
+      path: artifact.path,
+      hash: artifact.hash,
+    })),
+    verifyArtifacts: latestScopeVerify ? [{
+      id: latestScopeVerify.id,
+      path: latestScopeVerify.path,
+      hash: latestScopeVerify.hash,
+    }] : [],
+    rubric: getRubric("default"),
+  });
 
   return {
-    taskPrompt: lines.join("\n"),
+    assignment,
+    taskPrompt: buildLaunchPrompt(assignment),
     verifyCommands,
-    rubric: getRubric("default"),
+    rubric: assignment.rubric,
     reviewKind: "implementation",
   };
 }
@@ -336,95 +333,48 @@ export function buildContractEvaluationSpec(opts: {
   }
 
   const plan = loadLatestPlan(run.feature, projectRoot);
-  const lines: string[] = [];
-  lines.push(`Evaluate the pending sprint contracts for feature ${run.feature}.`);
-  lines.push("");
-  lines.push(`Run: ${run.id}`);
-
-  if (plan?.goal) {
-    lines.push(`Feature goal: ${plan.goal}`);
-    lines.push("");
-  }
-
-  lines.push("Review each proposed contract artifact below before any builder starts:");
-  for (const entry of pendingContracts) {
-    lines.push(`- ${entry.contract.id}: ${entry.artifact.path} (${entry.artifact.hash})`);
-  }
-
-  lines.push("");
-  lines.push("For every listed contract, decide ACCEPT or REJECT.");
-  lines.push("Reject contracts when the file scope, acceptance criteria, or verify commands are wrong or incomplete.");
-  lines.push("Return a structured result payload with one decision per contract.");
-  lines.push('Use decisions "ACCEPT" or "REJECT" and include notes for each contract.');
+  const assignment: ContractReviewAssignmentSpec = createContractReviewAssignmentSpec({
+    objective: `Review pending sprint contracts for feature ${run.feature}`,
+    runId: run.id,
+    feature: run.feature,
+    planGoal: plan?.goal,
+    contracts: pendingContracts.map((entry) => ({
+      id: entry.contract.id,
+      path: entry.artifact.path,
+      hash: entry.artifact.hash,
+      issueId: entry.contract.taskId,
+      title: entry.contract.id,
+    })),
+  });
 
   return {
-    taskPrompt: lines.join("\n"),
+    assignment,
+    taskPrompt: buildLaunchPrompt(assignment),
     verifyCommands: [],
     reviewKind: "contract",
     contractIds: pendingContracts.map((entry) => entry.contract.id),
   };
 }
 
-export function buildImplementationReviewCompletionCommand(agentName: string): string {
-  const payload = JSON.stringify({
-    kind: "implementation_review",
-    verdict: "<VERDICT>",
-    reworkPhase: "build",
-    scores: [{ criterion: "functionality", score: 0.0, feedback: "..." }],
-  });
-  return `cnog mail send orchestrator "review: <VERDICT>" --from ${agentName} --type result --payload '${payload}'`;
+export function buildImplementationReviewCompletionCommand(opts: {
+  agentName: string;
+  runId: string;
+  feature: string;
+  scopeId: string;
+  scopeHash: string;
+}): string {
+  return buildImplementationReviewResultCommand(opts);
 }
 
 export function buildContractReviewCompletionCommand(
-  agentName: string,
-  contractIds: string[],
+  opts: {
+    agentName: string;
+    runId: string;
+    feature: string;
+    contractIds: string[];
+  },
 ): string {
-  const payload = JSON.stringify({
-    kind: "contract_review",
-    contracts: contractIds.map((contractId) => ({
-      contractId,
-      decision: "ACCEPT",
-      notes: "...",
-    })),
-  });
-  return `cnog mail send orchestrator "contract review complete" --from ${agentName} --type result --payload '${payload}'`;
-}
-
-export function extractEvaluationVerdict(msg: EvaluationMessageLike): string | null {
-  if (msg.payload?.verdict) {
-    return String(msg.payload.verdict).toUpperCase();
-  }
-
-  const text = `${msg.subject} ${msg.body ?? ""}`;
-  const match = text.match(/\b(APPROVE|REQUEST_CHANGES|BLOCK)\b/i);
-  return match ? match[1].toUpperCase() : null;
-}
-
-function extractReworkPhase(
-  msg: EvaluationMessageLike,
-  verdict: string,
-): "build" | "contract" {
-  const explicit = msg.payload?.reworkPhase ?? msg.payload?.nextPhase;
-  if (explicit === "build" || explicit === "contract") {
-    return explicit;
-  }
-  return verdict === "BLOCK" ? "contract" : "build";
-}
-
-function extractContractReviewDecisions(msg: EvaluationMessageLike): ContractReviewDecision[] {
-  const payloadContracts = msg.payload?.contracts;
-  if (!Array.isArray(payloadContracts)) return [];
-  return payloadContracts.filter((decision): decision is ContractReviewDecision => (
-    !!decision
-    && typeof decision === "object"
-    && typeof (decision as ContractReviewDecision).contractId === "string"
-    && typeof (decision as ContractReviewDecision).decision === "string"
-  ));
-}
-
-export function isContractReviewMessage(msg: EvaluationMessageLike): boolean {
-  if (msg.payload?.kind === "contract_review") return true;
-  return extractContractReviewDecisions(msg).length > 0;
+  return buildContractReviewResultCommand(opts);
 }
 
 export function applyContractReviewResult(opts: {
@@ -432,7 +382,8 @@ export function applyContractReviewResult(opts: {
   sessionId: string;
   sessionName: string;
   feature: string;
-  message: EvaluationMessageLike;
+  payload: ContractReviewData;
+  summary: string;
   db: CnogDB;
   events: EventEmitter;
   projectRoot?: string;
@@ -440,14 +391,11 @@ export function applyContractReviewResult(opts: {
   const run = opts.db.runs.get(opts.runId);
   if (!run || run.status !== "contract") return 0;
 
-  const decisions = extractContractReviewDecisions(opts.message);
-  if (decisions.length === 0) return 0;
-
   const projectRoot = opts.projectRoot ?? process.cwd();
   const contracts = new ContractManager(opts.db, opts.events, projectRoot);
   const processed: Array<{ contractId: string; decision: "ACCEPT" | "REJECT"; notes: string | null }> = [];
 
-  for (const decision of decisions) {
+  for (const decision of opts.payload.contracts) {
     const normalized = decision.decision.toUpperCase();
     const notes = decision.notes ?? null;
     if (normalized === "ACCEPT") {
@@ -487,8 +435,7 @@ export function applyContractReviewResult(opts: {
       evaluatorSession: opts.sessionId,
       evaluatorName: opts.sessionName,
       decisions: processed,
-      subject: opts.message.subject,
-      body: opts.message.body ?? null,
+      summary: opts.summary,
       reviewedAt: new Date().toISOString(),
     },
     projectRoot,
@@ -518,41 +465,36 @@ export function applyEvaluationResult(opts: {
   sessionId: string;
   sessionName: string;
   feature: string;
-  message: EvaluationMessageLike;
+  payload: ImplementationReviewData;
+  summary: string;
   db: CnogDB;
   events: EventEmitter;
   lifecycle: Lifecycle;
   projectRoot?: string;
-}): string | null {
+}): ImplementationReviewData["verdict"] | null {
   const run = opts.db.runs.get(opts.runId);
   if (!run) return null;
   if (run.status !== "evaluate") return null;
 
-  let verdict: string | null = null;
   let gradingReport: ReturnType<typeof evaluateGrades> | null = null;
-
-  if (opts.message.payload?.scores && Array.isArray(opts.message.payload.scores)) {
-    const rubric = getRubric("default");
-    gradingReport = evaluateGrades({
-      taskId: "",
-      agentName: opts.sessionName,
-      feature: opts.feature,
-      rubric,
-      scores: opts.message.payload.scores as Array<{
-        criterion: string;
-        score: number;
-        feedback: string;
-      }>,
-    });
-    verdict = gradingReport.verdict;
-  } else {
-    verdict = extractEvaluationVerdict(opts.message);
+  const rubric = getRubric("default");
+  gradingReport = evaluateGrades({
+    taskId: "",
+    agentName: opts.sessionName,
+    feature: opts.feature,
+    rubric,
+    scores: opts.payload.scores,
+  });
+  const verdict = gradingReport.verdict;
+  if (verdict !== opts.payload.verdict) {
+    throw new Error(`Implementation review verdict mismatch: payload=${opts.payload.verdict} computed=${verdict}`);
   }
-
-  if (!verdict) return null;
 
   const activeScope = opts.db.reviewScopes.activeForRun(run.id);
   if (!activeScope) return verdict;
+  if (opts.payload.scopeId !== activeScope.id || opts.payload.scopeHash !== activeScope.scope_hash) {
+    throw new Error(`Implementation review payload does not match active scope ${activeScope.id}`);
+  }
 
   const artifactNonce = Date.now();
   const reviewReportArtifact = persistJsonArtifact({
@@ -570,9 +512,8 @@ export function applyEvaluationResult(opts: {
       evaluatorSession: opts.sessionId,
       evaluatorName: opts.sessionName,
       verdict,
-      subject: opts.message.subject,
-      body: opts.message.body ?? null,
-      payload: opts.message.payload ?? null,
+      summary: opts.summary,
+      payload: opts.payload,
       evaluatedAt: new Date().toISOString(),
     },
     projectRoot: opts.projectRoot,
@@ -592,7 +533,21 @@ export function applyEvaluationResult(opts: {
       // Leave the accepted scope recorded even if another actor already advanced.
     }
   } else {
-    const targetPhase = extractReworkPhase(opts.message, verdict);
+    const targetPhase = opts.payload.reworkPhase ?? (verdict === "BLOCK" ? "contract" : "build");
+    const controller = new RunController(
+      opts.db,
+      opts.events,
+      opts.projectRoot ?? process.cwd(),
+    );
+    controller.reopenScopeForRework({
+      runId: run.id,
+      feature: opts.feature,
+      scope: activeScope,
+      targetPhase,
+      verdict,
+      actor: opts.sessionName,
+      summary: opts.summary,
+    });
     try {
       opts.lifecycle.advanceRun(
         run.id,

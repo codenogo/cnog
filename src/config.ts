@@ -6,10 +6,11 @@
  */
 
 import { readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import YAML from "yaml";
 
-import { PID_FILE as PID_FILE_PATH, CNOG_DIR, DEFAULTS, findProjectRoot } from "./paths.js";
+import { PID_FILE as PID_FILE_PATH, CNOG_DIR, findProjectRoot } from "./paths.js";
+import type { WorktreeOptions } from "./worktree.js";
 
 export interface CnogConfig {
   project: {
@@ -35,6 +36,7 @@ export interface CnogConfig {
   verify: {
     commands: string[];
   };
+  worktree: WorktreeOptions;
 }
 
 const DEFAULT_CONFIG: CnogConfig = {
@@ -60,6 +62,12 @@ const DEFAULT_CONFIG: CnogConfig = {
   },
   verify: {
     commands: [],
+  },
+  worktree: {
+    reuseExisting: true,
+    pruneBeforeCreate: true,
+    sparsePaths: [],
+    symlinkDirectories: [],
   },
 };
 
@@ -116,6 +124,18 @@ export function loadConfig(projectRoot: string = findProjectRoot()): CnogConfig 
   }
 
   return config as unknown as CnogConfig;
+}
+
+/**
+ * Resolve the actual workspace root from the directory that owns .cnog/.
+ */
+export function resolveConfigProjectRoot(
+  discoveredRoot: string,
+  config: CnogConfig,
+): string {
+  return config.project.root === "."
+    ? discoveredRoot
+    : resolve(discoveredRoot, config.project.root);
 }
 
 /**

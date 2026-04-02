@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -32,6 +32,24 @@ describe.sequential("command context root resolution", () => {
     const ctx = buildContext(db);
 
     expect(ctx.projectRoot).toBe(realpathSync(tmpDir));
+
+    db.close();
+  });
+
+  it("honors config.project.root when building context", () => {
+    mkdirSync(join(tmpDir, "packages", "app"), { recursive: true });
+    writeFileSync(
+      join(tmpDir, CNOG_DIR, "config.yaml"),
+      "project:\n  root: packages/app\n",
+      "utf-8",
+    );
+
+    process.chdir(join(tmpDir, CNOG_DIR, "worktrees", "agent", "src"));
+
+    const db = openDb();
+    const ctx = buildContext(db);
+
+    expect(ctx.projectRoot).toBe(realpathSync(join(tmpDir, "packages", "app")));
 
     db.close();
   });

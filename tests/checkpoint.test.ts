@@ -45,6 +45,33 @@ function makeCheckpoint(overrides?: Partial<SessionCheckpoint>): SessionCheckpoi
     currentBranch: "cnog/auth/builder-auth-r1",
     pendingWork: "Add refresh token endpoint",
     verifyResults: { "npm test": true, "npx tsc --noEmit": true },
+    resumeContext: {
+      transcriptPath: ".cnog/features/auth/runs/run-checkpoint-auth/sessions/builder-auth-r1.log",
+      taskLogPath: ".cnog/features/auth/runs/run-checkpoint-auth/tasks/xtask-auth.output",
+      transcriptTail: "thinking...\nupdated auth middleware",
+      taskLogTail: "attempt 1\nedited src/auth.ts",
+      lastActivityAt: "2026-04-01T10:00:00.000Z",
+      lastActivitySummary: "Modified src/auth.ts",
+      toolUseCount: 3,
+      durationMs: 120000,
+      inputTokens: 111,
+      outputTokens: 222,
+      costUsd: 0.0123,
+      recentActivities: [
+        {
+          at: "2026-04-01T09:59:00.000Z",
+          kind: "write",
+          tool: "Write",
+          target: "src/auth.ts",
+          summary: "Modified src/auth.ts",
+        },
+      ],
+      scratchpad: {
+        shared: "/repo/.cnog/scratch/runs/run-checkpoint-auth/shared",
+        role: "/repo/.cnog/scratch/runs/run-checkpoint-auth/builder",
+        agent: "/repo/.cnog/scratch/runs/run-checkpoint-auth/builder/builder-auth-r1",
+      },
+    },
     ...overrides,
   };
 }
@@ -89,7 +116,9 @@ beforeEach(() => {
     capability: "builder",
     feature: FEATURE,
     task_id: null,
+    execution_task_id: null,
     worktree_path: null,
+    transcript_path: null,
     branch: "cnog/auth/builder-auth-r1",
     tmux_session: null,
     pid: null,
@@ -107,7 +136,9 @@ beforeEach(() => {
     capability: "builder",
     feature: FEATURE,
     task_id: null,
+    execution_task_id: null,
     worktree_path: null,
+    transcript_path: null,
     branch: "cnog/auth/builder-auth-s1",
     tmux_session: null,
     pid: null,
@@ -124,7 +155,9 @@ beforeEach(() => {
     capability: "builder",
     feature: FEATURE,
     task_id: null,
+    execution_task_id: null,
     worktree_path: null,
+    transcript_path: null,
     branch: "cnog/auth/builder-auth-s2",
     tmux_session: null,
     pid: null,
@@ -173,6 +206,11 @@ describe("checkpoint CRUD", () => {
     expect(progress).toContain("src/auth.ts");
     expect(progress).toContain("Pending work");
     expect(progress).toContain("refresh token");
+    expect(progress).toContain("Resume context");
+    expect(progress).toContain("Transcript tail");
+    expect(progress).toContain("Task log tail");
+    expect(progress).toContain("Scratchpad");
+    expect(progress).toContain("Modified src/auth.ts");
   });
 });
 

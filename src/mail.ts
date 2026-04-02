@@ -6,7 +6,15 @@
  */
 
 import type { CnogDB } from "./db.js";
-import type { MessageRow, MessageType, Priority } from "./types.js";
+import {
+  WorkerNotificationPayloadSchema,
+} from "./types.js";
+import type {
+  MessageRow,
+  MessageType,
+  Priority,
+  WorkerNotificationPayload,
+} from "./types.js";
 
 function safeJsonParse(str: string): Record<string, unknown> | null {
   try {
@@ -46,6 +54,13 @@ function rowToMessage(row: MessageRow): Message {
   };
 }
 
+function validatePayload(type: MessageType, payload: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (type === "worker_notification") {
+    return WorkerNotificationPayloadSchema.parse(payload);
+  }
+  return payload;
+}
+
 export class MailClient {
   constructor(private readonly db: CnogDB) {}
 
@@ -63,6 +78,7 @@ export class MailClient {
     payload?: Record<string, unknown>;
     runId?: string;
   }): number {
+    const payload = validatePayload(opts.type ?? "status", opts.payload);
     return this.db.messages.send({
       from_agent: opts.fromAgent,
       to_agent: opts.toAgent,
@@ -71,7 +87,7 @@ export class MailClient {
       type: opts.type ?? "status",
       priority: opts.priority ?? "normal",
       thread_id: opts.threadId ?? null,
-      payload: opts.payload ? JSON.stringify(opts.payload) : null,
+      payload: payload ? JSON.stringify(payload) : null,
       run_id: opts.runId ?? null,
     });
   }
@@ -127,62 +143,15 @@ export class MailClient {
     });
   }
 
-  // -------------------------------------------------------------------------
-  // Standard protocol methods
-  // -------------------------------------------------------------------------
-
-  /**
-   * Agent reports task completion.
-   */
-  notifyWorkerDone(opts: {
-    agentName: string;
-    feature: string;
-    branch: string;
-    filesModified?: string[];
-  }): number {
-    return this.send({
-      fromAgent: opts.agentName,
-      toAgent: "orchestrator",
-      subject: "done",
-      type: "worker_done",
-      priority: "high",
-      payload: {
-        feature: opts.feature,
-        branch: opts.branch,
-        files_modified: opts.filesModified ?? [],
-      },
-    });
-  }
-
-  /**
-   * Explicit merge readiness signal.
-   */
-  notifyMergeReady(agentName: string, feature: string, branch: string): number {
+  notifyWorkerNotification(agentName: string, payload: WorkerNotificationPayload): number {
     return this.send({
       fromAgent: agentName,
       toAgent: "orchestrator",
-      subject: "merge ready",
-      type: "merge_ready",
+      subject: `${payload.data.kind}: ${payload.summary}`,
+      type: "worker_notification",
       priority: "high",
-      payload: { feature, branch },
-    });
-  }
-
-  /**
-   * Agent is blocked and needs help.
-   */
-  escalate(opts: {
-    agentName: string;
-    subject: string;
-    body: string;
-  }): number {
-    return this.send({
-      fromAgent: opts.agentName,
-      toAgent: "orchestrator",
-      subject: opts.subject,
-      body: opts.body,
-      type: "escalation",
-      priority: "high",
+      payload,
+      runId: payload.run.id,
     });
   }
 }

@@ -4,13 +4,6 @@ import type { Capability } from "../types.js";
 import { CapabilitySchema } from "../types.js";
 import * as tmux from "../tmux.js";
 import { isOrchestratorRunning } from "../config.js";
-import {
-  buildContractEvaluationSpec,
-  buildContractReviewCompletionCommand,
-  buildImplementationReviewCompletionCommand,
-  buildReviewScope,
-  buildRunEvaluationSpec,
-} from "../review.js";
 import { withDb, buildContext } from "./context.js";
 import { startCommand } from "./orchestrator.js";
 
@@ -18,7 +11,9 @@ export function slingCommand(feature: string, profile?: string, runtime?: string
   // Ensure the orchestrator daemon is running
   if (!isOrchestratorRunning()) {
     console.log(chalk.gray("  Starting orchestrator daemon..."));
-    startCommand();
+    if (!startCommand()) {
+      throw new Error("Failed to start orchestrator daemon.");
+    }
   }
 
   withDb((db) => {
@@ -124,8 +119,26 @@ export function inspectCommand(name: string, opts: { json: boolean }): void {
     console.log(`  State: ${s.state}`);
     console.log(`  Branch: ${s.branch}`);
     console.log(`  Worktree: ${s.worktreePath}`);
+    console.log(`  Transcript: ${s.transcriptPath}`);
+    if (s.taskLogPath) console.log(`  Task log: ${s.taskLogPath}`);
     console.log(`  PID: ${s.pid}`);
     console.log(`  Started: ${s.startedAt}`);
+    if (s.durationMs !== undefined) console.log(`  Duration: ${s.durationMs}ms`);
+    if (s.toolUseCount !== undefined) console.log(`  Tool uses: ${s.toolUseCount}`);
+    if (s.inputTokens !== undefined || s.outputTokens !== undefined) {
+      console.log(`  Tokens: in=${s.inputTokens ?? 0} out=${s.outputTokens ?? 0}`);
+    }
+    if ((s.costUsd ?? 0) > 0) console.log(`  Cost: $${(s.costUsd ?? 0).toFixed(4)}`);
+    if (s.progressSummary) console.log(`  Summary: ${s.progressSummary}`);
+    if (s.lastActivitySummary) console.log(`  Last activity: ${s.lastActivitySummary}`);
+    if (s.lastActivityAt) console.log(`  Last activity at: ${s.lastActivityAt}`);
+    if (s.recentActivities && s.recentActivities.length > 0) {
+      console.log("");
+      console.log(chalk.bold("Recent activities:"));
+      for (const activity of s.recentActivities.slice(-5)) {
+        console.log(`  ${activity.at} [${activity.kind}] ${activity.summary}`);
+      }
+    }
     if (result.recentOutput) {
       console.log("");
       console.log(chalk.bold("Recent output:"));
@@ -150,99 +163,20 @@ export function heartbeatCommand(name: string): void {
 export function evaluateCommand(feature: string, runtime?: string): void {
   withDb((db) => {
     const ctx = buildContext(db);
-    const run = ctx.lifecycle.latestRun(feature);
-    if (!run) {
-      throw new Error(`No run found for feature ${feature}`);
+    const result = ctx.execution.requestEvaluation(
+      feature,
+      runtime ?? ctx.config.agents.runtime,
+    );
+
+    switch (result.status) {
+      case "spawned":
+        console.log(chalk.green(`Spawned evaluator: ${result.agent}`));
+        return;
+      case "idle":
+      case "blocked":
+        throw new Error(result.reason);
+      case "error":
+        throw new Error(result.error);
     }
-
-    const identity = ctx.agents.allocateIdentity(`evaluator-${feature}`);
-    let info;
-
-    if (run.status === "contract") {
-      const contractSpec = buildContractEvaluationSpec({
-        runId: run.id,
-        feature,
-        db: ctx.db,
-        projectRoot: ctx.projectRoot,
-      });
-      info = ctx.agents.spawn({
-        identity,
-        runtimeId: runtime ?? ctx.config.agents.runtime,
-        capability: "evaluator",
-        feature,
-        taskPrompt: contractSpec.taskPrompt,
-        runId: run.id,
-        verifyCommands: contractSpec.verifyCommands,
-        baseBranch: ctx.config.project.canonicalBranch,
-        completionCommand: buildContractReviewCompletionCommand(
-          identity.name,
-          contractSpec.contractIds ?? [],
-        ),
-      });
-    } else {
-      const remainingIssues = ctx.db.issues
-        .list({ run_id: run.id })
-        .filter((issue) => issue.status === "open" || issue.status === "in_progress");
-      const activeBuilders = ctx.db.sessions.list({ run_id: run.id })
-        .filter((session) =>
-          session.capability === "builder"
-          && session.state !== "completed"
-          && session.state !== "failed",
-        );
-      const pendingBranches = ctx.db.merges.pendingForRun(run.id);
-
-      if (remainingIssues.length > 0 || activeBuilders.length > 0) {
-        throw new Error(
-          `Feature ${feature} still has implementation work in flight. Finish all builders before evaluation.`,
-        );
-      }
-
-      if (pendingBranches.length === 0) {
-        throw new Error(`Feature ${feature} has no completed branches ready for evaluation.`);
-      }
-
-      if (run.status === "build") {
-        ctx.lifecycle.advanceRun(run.id, "evaluate");
-      } else if (run.status !== "evaluate") {
-        throw new Error(
-          `Feature ${feature} is in ${run.status} phase. Complete implementation before evaluation.`,
-        );
-      }
-
-      let scope = ctx.db.reviewScopes.activeForRun(run.id);
-      if (!scope) {
-        const scopeId = buildReviewScope({
-          runId: run.id,
-          feature,
-          db: ctx.db,
-          projectRoot: ctx.projectRoot,
-        });
-        ctx.events.scopeCreated(scopeId, run.id, feature);
-        scope = ctx.db.reviewScopes.get(scopeId)!;
-      }
-
-      const reviewSpec = buildRunEvaluationSpec({
-        runId: run.id,
-        scopeId: scope.id,
-        db: ctx.db,
-        canonicalBranch: ctx.config.project.canonicalBranch,
-        projectRoot: ctx.projectRoot,
-      });
-
-      info = ctx.agents.spawn({
-        identity,
-        runtimeId: runtime ?? ctx.config.agents.runtime,
-        capability: "evaluator",
-        feature,
-        taskPrompt: reviewSpec.taskPrompt,
-        runId: run.id,
-        verifyCommands: reviewSpec.verifyCommands,
-        rubric: reviewSpec.rubric,
-        baseBranch: ctx.config.project.canonicalBranch,
-        completionCommand: buildImplementationReviewCompletionCommand(identity.name),
-      });
-      ctx.db.reviewScopes.updateStatus(scope.id, "evaluating");
-    }
-    console.log(chalk.green(`Spawned evaluator: ${info.name}`));
   });
 }

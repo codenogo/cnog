@@ -2,6 +2,7 @@ import chalk from "chalk";
 
 import { openDb, withDb, buildContext } from "./context.js";
 import { runDashboard } from "../dashboard.js";
+import { projectFileSize } from "../file-tail.js";
 import {
   loadCheckpoint,
   loadHandoffs,
@@ -9,6 +10,52 @@ import {
   type CheckpointSelector,
 } from "../checkpoint.js";
 import { getRubric } from "../grading.js";
+import { loadConfig, resolveConfigProjectRoot } from "../config.js";
+import { findProjectRoot } from "../paths.js";
+import type { SessionActivityKind } from "../types.js";
+
+function classifyActivity(toolName?: string): SessionActivityKind {
+  switch ((toolName ?? "").toLowerCase()) {
+    case "read":
+      return "read";
+    case "write":
+    case "edit":
+    case "multiedit":
+      return "write";
+    case "grep":
+    case "glob":
+      return "search";
+    case "bash":
+      return "bash";
+    default:
+      return "other";
+  }
+}
+
+function summarizeActivity(toolName?: string, target?: string): string {
+  const tool = toolName?.trim();
+  const normalizedTarget = target?.trim();
+  if (!tool) {
+    return normalizedTarget ? `Activity on ${normalizedTarget}` : "Activity recorded";
+  }
+
+  switch (tool.toLowerCase()) {
+    case "read":
+      return normalizedTarget ? `Read ${normalizedTarget}` : "Read files";
+    case "write":
+    case "edit":
+    case "multiedit":
+      return normalizedTarget ? `Modified ${normalizedTarget}` : "Modified files";
+    case "grep":
+      return normalizedTarget ? `Searched ${normalizedTarget}` : "Searched code";
+    case "glob":
+      return normalizedTarget ? `Listed ${normalizedTarget}` : "Listed files";
+    case "bash":
+      return normalizedTarget ? `Ran shell command for ${normalizedTarget}` : "Ran shell command";
+    default:
+      return normalizedTarget ? `${tool} ${normalizedTarget}` : `Used ${tool}`;
+  }
+}
 
 function resolveCheckpointSelector(
   db: ReturnType<typeof openDb>,
@@ -102,6 +149,10 @@ export function checkpointShowCommand(agent: string, opts: { json: boolean }): v
     console.log(`  Summary: ${checkpoint.progressSummary}`);
     if (checkpoint.pendingWork) console.log(`  Pending: ${checkpoint.pendingWork}`);
     if (checkpoint.filesModified.length > 0) console.log(`  Files: ${checkpoint.filesModified.join(", ")}`);
+    console.log(`  Transcript: ${checkpoint.resumeContext.transcriptPath ?? "-"}`);
+    console.log(`  Task log: ${checkpoint.resumeContext.taskLogPath ?? "-"}`);
+    console.log(`  Last activity: ${checkpoint.resumeContext.lastActivitySummary ?? "-"}`);
+    console.log(`  Tool uses: ${checkpoint.resumeContext.toolUseCount}`);
   });
 }
 
@@ -110,6 +161,109 @@ export function progressCommand(agent: string): void {
     const selector = resolveCheckpointSelector(db, agent);
     const progress = selector ? loadProgressArtifact(db, selector) : null;
     console.log(progress ?? chalk.gray("No progress artifact found."));
+  });
+}
+
+export function runtimeProgressUpdateCommand(opts: {
+  agent: string;
+  tool?: string;
+  target?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+  quiet?: boolean;
+}): void {
+  withDb((db) => {
+    const discoveredRoot = findProjectRoot();
+    const config = loadConfig(discoveredRoot);
+    const projectRoot = resolveConfigProjectRoot(discoveredRoot, config);
+    const session = db.sessions.get(opts.agent);
+    if (!session) {
+      throw new Error(`Agent ${opts.agent} not found.`);
+    }
+
+    db.sessions.heartbeat(opts.agent);
+
+    const transcriptSize = projectFileSize(session.transcript_path, projectRoot);
+    const activityKind = classifyActivity(opts.tool);
+    const summary = summarizeActivity(opts.tool, opts.target);
+
+    db.sessionProgress.recordActivity({
+      sessionId: session.id,
+      runId: session.run_id,
+      executionTaskId: session.execution_task_id,
+      transcriptPath: session.transcript_path,
+      transcriptSize,
+      toolName: opts.tool ?? null,
+      activityKind,
+      summary,
+      target: opts.target ?? null,
+    });
+
+    if ((opts.inputTokens ?? 0) > 0 || (opts.outputTokens ?? 0) > 0 || (opts.costUsd ?? 0) > 0) {
+      db.metrics.record({
+        agent_name: session.name,
+        feature: session.feature ?? "",
+        run_id: session.run_id,
+        input_tokens: opts.inputTokens ?? 0,
+        output_tokens: opts.outputTokens ?? 0,
+        cost_usd: opts.costUsd ?? 0,
+      });
+      const existing = db.sessionProgress.get(session.id);
+      db.sessionProgress.update(session.id, {
+        input_tokens: (existing?.input_tokens ?? 0) + (opts.inputTokens ?? 0),
+        output_tokens: (existing?.output_tokens ?? 0) + (opts.outputTokens ?? 0),
+        cost_usd: (existing?.cost_usd ?? 0) + (opts.costUsd ?? 0),
+      });
+    }
+
+    if (!opts.quiet) {
+      console.log(chalk.green(`Progress updated for ${opts.agent}: ${summary}`));
+    }
+  });
+}
+
+export function runtimeProgressShowCommand(agent: string, opts: { json: boolean }): void {
+  withDb((db) => {
+    const session = db.sessions.get(agent) ?? db.sessions.getLatestByLogicalName(agent);
+    if (!session) {
+      console.log(chalk.gray("No session found."));
+      return;
+    }
+    const progress = db.sessionProgress.get(session.id);
+    if (!progress) {
+      console.log(chalk.gray("No runtime progress recorded."));
+      return;
+    }
+    if (opts.json) {
+      console.log(JSON.stringify({
+        ...progress,
+        recentActivities: JSON.parse(progress.recent_activities_json),
+      }, null, 2));
+      return;
+    }
+    console.log(chalk.bold(`Runtime Progress: ${session.name}`));
+    console.log(`  Tool uses: ${progress.tool_use_count}`);
+    console.log(`  Tokens: in=${progress.input_tokens} out=${progress.output_tokens}`);
+    console.log(`  Cost: $${progress.cost_usd.toFixed(4)}`);
+    console.log(`  Last activity: ${progress.last_activity_summary ?? "-"}`);
+    console.log(`  Last activity at: ${progress.last_activity_at ?? "-"}`);
+    console.log(`  Transcript: ${progress.transcript_path ?? "-"}`);
+    console.log(`  Transcript size: ${progress.transcript_size}`);
+    if (session.execution_task_id) {
+      const task = db.executionTasks.get(session.execution_task_id);
+      if (task?.output_path) {
+        console.log(`  Task log: ${task.output_path}`);
+      }
+    }
+    const recent = JSON.parse(progress.recent_activities_json) as Array<{ at: string; summary: string }>;
+    if (recent.length > 0) {
+      console.log("");
+      console.log(chalk.bold("Recent activities"));
+      for (const item of recent.slice(-5)) {
+        console.log(`  ${item.at} ${item.summary}`);
+      }
+    }
   });
 }
 

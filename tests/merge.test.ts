@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 
 import { CnogDB } from "../src/db.js";
 import { EventEmitter } from "../src/events.js";
+import { CnogError } from "../src/errors.js";
 import { Lifecycle } from "../src/lifecycle.js";
 import { MergeQueue } from "../src/merge.js";
 import { computeScopeHash } from "../src/review.js";
@@ -29,7 +30,7 @@ function createTestSession(db: CnogDB, runId: string, feature: string): string {
   const name = `builder-merge-${sessionSeq}`;
   db.sessions.create({
     id, name, logical_name: name, attempt: 1, runtime: "claude", capability: "builder",
-    feature, task_id: null, worktree_path: null, branch: null, tmux_session: null,
+    feature, task_id: null, execution_task_id: null, worktree_path: null, transcript_path: null, branch: null, tmux_session: null,
     pid: null, state: "working", parent_agent: null, run_id: runId,
   });
   return id;
@@ -66,6 +67,202 @@ describe("MergeQueue", () => {
     const pending = queue.pending();
     expect(pending).toHaveLength(1);
     expect(pending[0].branch).toBe("cnog/auth/builder-1");
+    expect(db.executionTasks.getByLogicalName(testRunId, `merge:${id}`)).toMatchObject({
+      kind: "merge",
+      capability: "system",
+      status: "pending",
+      summary: "Pending merge for cnog/auth/builder-1",
+    });
+  });
+
+  it("anchors issue-backed merge tasks to the canonical build task", () => {
+    const queue = new MergeQueue(db, events, "main", tmpDir);
+    const issueId = "issue-merge-parent";
+    db.issues.create({
+      id: issueId,
+      title: "Implement merge parent",
+      description: null,
+      issue_type: "task",
+      status: "in_progress",
+      priority: 1,
+      assignee: "builder-merge-1",
+      feature: "auth",
+      run_id: testRunId,
+      plan_number: null,
+      phase: null,
+      parent_id: null,
+      metadata: null,
+    });
+    db.executionTasks.create({
+      id: "xtask-build-parent",
+      run_id: testRunId,
+      issue_id: issueId,
+      review_scope_id: null,
+      parent_task_id: null,
+      logical_name: `build:${issueId}`,
+      kind: "build",
+      capability: "builder",
+      executor: "agent",
+      status: "completed",
+      active_session_id: null,
+      summary: "Build completed",
+      output_path: null,
+      result_path: null,
+      output_offset: 0,
+      notified: 1,
+      notified_at: "2026-04-01 10:00:00",
+      last_error: null,
+    });
+
+    const sessionId = createTestSession(db, testRunId, "auth");
+    const id = queue.enqueue({
+      feature: "auth",
+      branch: "cnog/auth/builder-parent",
+      agentName: "builder-parent",
+      runId: testRunId,
+      sessionId,
+      taskId: issueId,
+      headSha: "abc123",
+      filesModified: ["src/auth.ts"],
+    });
+
+    expect(db.executionTasks.getByLogicalName(testRunId, `merge:${id}`)).toMatchObject({
+      parent_task_id: "xtask-build-parent",
+      issue_id: issueId,
+    });
+  });
+
+  it("repairs existing merge tasks by restoring both issue linkage and parent lineage", () => {
+    const queue = new MergeQueue(db, events, "main", tmpDir);
+    const issueId = "issue-merge-repair";
+    db.issues.create({
+      id: issueId,
+      title: "Repair merge lineage",
+      description: null,
+      issue_type: "task",
+      status: "done",
+      priority: 1,
+      assignee: null,
+      feature: "auth",
+      run_id: testRunId,
+      plan_number: null,
+      phase: null,
+      parent_id: null,
+      metadata: null,
+    });
+    db.executionTasks.create({
+      id: "xtask-build-repair-parent",
+      run_id: testRunId,
+      issue_id: issueId,
+      review_scope_id: null,
+      parent_task_id: null,
+      logical_name: `build:${issueId}`,
+      kind: "build",
+      capability: "builder",
+      executor: "agent",
+      status: "completed",
+      active_session_id: null,
+      summary: "Build completed",
+      output_path: null,
+      result_path: null,
+      output_offset: 0,
+      notified: 1,
+      notified_at: "2026-04-01 10:00:00",
+      last_error: null,
+    });
+    db.executionTasks.create({
+      id: "xtask-wrong-parent",
+      run_id: testRunId,
+      issue_id: null,
+      review_scope_id: null,
+      parent_task_id: null,
+      logical_name: "build:wrong-parent",
+      kind: "build",
+      capability: "builder",
+      executor: "agent",
+      status: "failed",
+      active_session_id: null,
+      summary: "Stale parent task",
+      output_path: null,
+      result_path: null,
+      output_offset: 0,
+      notified: 1,
+      notified_at: "2026-04-01 10:01:00",
+      last_error: "stale",
+    });
+
+    const sessionId = createTestSession(db, testRunId, "auth");
+    const mergeId = db.merges.enqueue({
+      feature: "auth",
+      branch: "cnog/auth/builder-repair",
+      agent_name: "builder-repair",
+      run_id: testRunId,
+      session_id: sessionId,
+      task_id: issueId,
+      head_sha: "abc123",
+      files_modified: null,
+    });
+
+    db.executionTasks.create({
+      id: `xtask-merge-${mergeId}`,
+      run_id: testRunId,
+      issue_id: null,
+      review_scope_id: null,
+      parent_task_id: "xtask-wrong-parent",
+      logical_name: `merge:${mergeId}`,
+      kind: "merge",
+      capability: "system",
+      executor: "system",
+      status: "pending",
+      active_session_id: null,
+      summary: "Pending merge for cnog/auth/builder-repair",
+      output_path: null,
+      result_path: null,
+      output_offset: 0,
+      notified: 0,
+      notified_at: null,
+      last_error: null,
+    });
+
+    queue.processNext();
+
+    expect(db.executionTasks.getByLogicalName(testRunId, `merge:${mergeId}`)).toMatchObject({
+      issue_id: issueId,
+      parent_task_id: "xtask-build-repair-parent",
+    });
+  });
+
+  it("rejects issue-backed merge enqueue when the canonical build task is missing", () => {
+    const queue = new MergeQueue(db, events, "main", tmpDir);
+    const issueId = "issue-missing-parent";
+    db.issues.create({
+      id: issueId,
+      title: "Missing build task",
+      description: null,
+      issue_type: "task",
+      status: "done",
+      priority: 1,
+      assignee: null,
+      feature: "auth",
+      run_id: testRunId,
+      plan_number: null,
+      phase: null,
+      parent_id: null,
+      metadata: null,
+    });
+
+    const sessionId = createTestSession(db, testRunId, "auth");
+
+    expect(() => queue.enqueue({
+      feature: "auth",
+      branch: "cnog/auth/builder-missing-parent",
+      agentName: "builder-missing-parent",
+      runId: testRunId,
+      sessionId,
+      taskId: issueId,
+      headSha: "abc123",
+    })).toThrowError(CnogError);
+    expect(db.merges.listForRun(testRunId)).toHaveLength(0);
   });
 
   it("pending() filters by feature", () => {
@@ -114,6 +311,7 @@ describe("MergeQueue", () => {
     expect(result).not.toBeNull();
     expect(result!.success).toBe(false);
     expect(result!.message).toContain("blocked");
+    expect(db.executionTasks.getByLogicalName(testRunId, "merge:1")?.status).toBe("pending");
   });
 
   it("enqueue logs merge event", () => {
@@ -146,6 +344,26 @@ describe("MergeQueue", () => {
       parent_id: null,
       metadata: null,
     });
+    db.executionTasks.create({
+      id: "xtask-build-conflict",
+      run_id: testRunId,
+      issue_id: issueId,
+      review_scope_id: null,
+      parent_task_id: null,
+      logical_name: `build:${issueId}`,
+      kind: "build",
+      capability: "builder",
+      executor: "agent",
+      status: "completed",
+      active_session_id: null,
+      summary: "Build completed",
+      output_path: null,
+      result_path: null,
+      output_offset: 0,
+      notified: 1,
+      notified_at: "2026-04-01 10:00:00",
+      last_error: null,
+    });
 
     const sessionId = createTestSession(db, testRunId, "auth");
     const mergeId = db.merges.enqueue({
@@ -162,8 +380,8 @@ describe("MergeQueue", () => {
     const evalSessionId = `sess-eval-conflict-${++sessionSeq}`;
     db.sessions.create({
       id: evalSessionId, name: `evaluator-conflict-${sessionSeq}`, logical_name: `evaluator-conflict-${sessionSeq}`,
-      attempt: 1, runtime: "claude", capability: "evaluator", feature: "auth", task_id: null,
-      worktree_path: null, branch: null, tmux_session: null, pid: null, state: "working",
+      attempt: 1, runtime: "claude", capability: "evaluator", feature: "auth", task_id: null, execution_task_id: null,
+      worktree_path: null, transcript_path: null, branch: null, tmux_session: null, pid: null, state: "working",
       parent_agent: null, run_id: testRunId,
     });
     db.reviewScopes.create({
@@ -197,6 +415,7 @@ describe("MergeQueue", () => {
     expect(db.issues.get(issueId)?.status).toBe("open");
     expect(db.runs.get(testRunId)?.status).toBe("build");
     expect(db.reviewScopes.get(scopeId)?.scope_status).toBe("stale");
+    expect(db.executionTasks.getByLogicalName(testRunId, `merge:${mergeId}`)?.status).toBe("failed");
 
     const mergeArtifacts = db.artifacts.listByRun(testRunId, "merge-record");
     expect(mergeArtifacts).toHaveLength(1);

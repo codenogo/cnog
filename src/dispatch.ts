@@ -33,6 +33,7 @@ export interface DispatchResult {
   status: "proposed" | "spawned" | "skipped" | "error";
   contractId?: string;
   error?: string;
+  terminal?: boolean;
 }
 
 function planHash(plan: Plan): string {
